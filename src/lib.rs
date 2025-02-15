@@ -1,17 +1,15 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
-};
+use std::{collections::HashMap, ops::Deref};
 
 use egui::{
-    Color32, ColorImage, Context, CursorIcon, Id, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2,
-    Widget,
+    Color32, Context, CursorIcon, Id, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, Widget,
 };
 use geo::Point;
-use reqwest::ClientBuilder;
-use tokio::sync::mpsc::Sender;
 
-static DEFAULT_TILE_PROVIDER: LazyLock<TokioTileLoader> = LazyLock::new(TokioTileLoader::new);
+mod tile_loader;
+mod url_provider;
+
+pub use crate::tile_loader::*;
+pub use crate::url_provider::*;
 
 #[derive(Clone)]
 struct EMapState {
@@ -69,6 +67,7 @@ enum Shape {
 pub struct EMap<'t> {
     id: egui::Id,
     tile_url_provider: &'t dyn TileUrlProvider,
+    tile_loader: Option<&'t dyn TileLoader>,
 
     tile_size: f64,
 
@@ -80,6 +79,7 @@ impl<'t> EMap<'t> {
         Self {
             id: Id::new(id),
             tile_url_provider: &OsmStandardTileUrlProvider,
+            tile_loader: None,
 
             tile_size: 256.0,
 
@@ -118,6 +118,11 @@ impl<'t> EMap<'t> {
         self
     }
 
+    pub fn tile_loader(mut self, loader: &'t dyn TileLoader) -> Self {
+        self.tile_loader = Some(loader);
+        self
+    }
+
     pub fn circle(
         mut self,
         center: Point<f64>,
@@ -145,6 +150,20 @@ impl<'t> EMap<'t> {
         self
     }
 
+    pub fn set_position(self, ctx: &Context, lat: f64, lon: f64, zoom: u8) -> Self {
+        ctx.data_mut(|d| {
+            let s = d.get_temp_mut_or_insert_with::<EMapState>(self.id, || EMapState::new());
+
+            let p = Point::new(lon, lat);
+            let coords = normalized_mercator(p);
+
+            s.x = coords.x();
+            s.y = coords.y();
+            s.zoom = zoom as f64;
+        });
+        self
+    }
+
     fn find_texture_handle(
         &self,
         tile: &TileId,
@@ -158,7 +177,12 @@ impl<'t> EMap<'t> {
         }
 
         let url = self.tile_url_provider.url(*tile).to_string();
-        let img_data = DEFAULT_TILE_PROVIDER.tile(url, tile, ctx.clone());
+
+        let loader: &dyn TileLoader = self
+            .tile_loader
+            .unwrap_or_else(|| DEFAULT_TILE_LOADER.deref());
+
+        let img_data = loader.tile(url, tile, ctx.clone());
         if let Some(img_data) = img_data {
             let h = ctx.load_texture(
                 format!("{:?}", tile),
@@ -216,9 +240,6 @@ impl Widget for EMap<'_> {
 
         if let Some(pos) = r.hover_pos() {
             if dy.abs() >= 0.01 {
-                // let pointer_x_norm = scale(pos.x as f64, vx_min, vx_max, east, west);
-                // let pointer_y_norm = scale(pos.y as f64, vy_min, vy_max, south, north);
-
                 let pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
 
                 state.zoom += (dy as f64) * 0.01;
@@ -237,6 +258,11 @@ impl Widget for EMap<'_> {
             }
         }
 
+        // let a_zoom = ui
+        //     .ctx()
+        //     .animate_value_with_time("zoom".into(), state.zoom as f32, 0.5);
+        // let n_rect = norm_rect(state.x, state.y, state.zoom, desired_tiles);
+
         ui.ctx().output_mut(|o| o.cursor_icon = CursorIcon::Grab);
 
         let east = n_rect.min().x;
@@ -253,6 +279,7 @@ impl Widget for EMap<'_> {
             reverse_normalized_mercator(Point::new(east as f64, north as f64)),
             reverse_normalized_mercator(Point::new(west as f64, south as f64)),
             state.zoom as u8,
+            2,
         );
 
         for tile in &tiles {
@@ -456,7 +483,7 @@ impl TileId {
         Self { x, y, z: zoom }
     }
 
-    fn from_bounds(p1: Point<f64>, p2: Point<f64>, zoom: u8) -> Vec<Self> {
+    fn from_bounds(p1: Point<f64>, p2: Point<f64>, zoom: u8, padding: i32) -> Vec<Self> {
         let left_x = p1.x().min(p2.x());
         let right_x = p1.x().max(p2.x());
 
@@ -473,8 +500,8 @@ impl TileId {
 
         let n = 2u32.pow(zoom as u32);
 
-        for x in top_left_tile.x..=bottom_right_tile.x {
-            for y in top_left_tile.y..=bottom_right_tile.y {
+        for x in (top_left_tile.x - padding)..=(bottom_right_tile.x + padding) {
+            for y in (top_left_tile.y - padding)..=(bottom_right_tile.y + padding) {
                 if x < 0 || y < 0 || x >= n as i32 || y >= n as i32 {
                     continue;
                 }
@@ -531,138 +558,5 @@ impl TileId {
         let uv = Rect::from_min_max(Pos2::new(uv_top, uv_left), Pos2::new(uv_bottom, uv_right));
 
         (new_tile, uv)
-    }
-}
-
-pub trait TileUrlProvider {
-    fn url(&self, tile_id: TileId) -> String;
-}
-
-impl<O, F> TileUrlProvider for F
-where
-    O: ToString,
-    F: Fn(&TileId) -> O,
-{
-    fn url(&self, tile_id: TileId) -> String {
-        self(&tile_id).to_string()
-    }
-}
-
-enum Fetch {
-    Pending,
-    Done(Arc<ColorImage>),
-}
-
-pub trait TileLoader {
-    fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>>;
-}
-
-struct TokioTileLoader {
-    tx: Sender<(TileId, String, Context)>,
-    tiles: Arc<Mutex<HashMap<TileId, Fetch>>>,
-}
-
-impl TokioTileLoader {
-    fn new() -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
-        let tiles = Arc::new(Mutex::new(HashMap::new()));
-        let t1 = tiles.clone();
-        std::thread::spawn(move || {
-            let tiles = t1;
-            let rt = tokio::runtime::Runtime::new().unwrap();
-
-            rt.block_on(async move {
-                let client = Arc::new(ClientBuilder::default().build().unwrap());
-                loop {
-                    let (tile_id, url, ctx): (TileId, String, Context) = rx.recv().await.unwrap();
-                    let ts = tiles.clone();
-                    {
-                        ts.lock().unwrap().insert(tile_id, Fetch::Pending);
-                    }
-                    let ts = tiles.clone();
-                    let c = client.clone();
-                    tokio::spawn(async move {
-                        let client = c;
-
-                        let user_agent =
-                            format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-
-                        let r = client
-                            .get(url)
-                            .header("user-agent", user_agent)
-                            .send()
-                            .await
-                            .unwrap();
-                        let b = r.bytes().await.unwrap();
-
-                        tokio::task::spawn_blocking(move || {
-                            let image = image::load_from_memory(&b.clone()).unwrap();
-                            let size = [image.width() as _, image.height() as _];
-                            let image_buffer = image.to_rgba8();
-                            let pixels = image_buffer.as_flat_samples();
-
-                            let color_image =
-                                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-
-                            ts.lock()
-                                .unwrap()
-                                .insert(tile_id, Fetch::Done(color_image.into()));
-                            ctx.request_repaint();
-                        });
-                    });
-                }
-            });
-        });
-
-        TokioTileLoader { tiles, tx }
-    }
-}
-
-impl TileLoader for TokioTileLoader {
-    fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>> {
-        let t = self.tiles.lock().unwrap();
-        match t.get(tile_id) {
-            Some(Fetch::Pending) => None,
-            Some(Fetch::Done(c)) => Some(c.clone()),
-            None => {
-                self.tx.blocking_send((*tile_id, url, ctx)).unwrap();
-                None
-            }
-        }
-    }
-}
-
-pub struct MapBoxTileUrlProvider {
-    token: String,
-    style: String,
-}
-
-impl MapBoxTileUrlProvider {
-    pub fn new(token: &str, style: &str) -> Self {
-        Self {
-            token: token.to_string(),
-            style: style.to_string(),
-        }
-    }
-}
-
-impl TileUrlProvider for MapBoxTileUrlProvider {
-    fn url(&self, tile_id: TileId) -> String {
-        format!(
-            "https://api.mapbox.com/styles/v1/{}/tiles/{}/{}/{}@2x?access_token={}",
-            self.style, tile_id.z, tile_id.x, tile_id.y, self.token
-        )
-    }
-}
-
-#[derive(Default)]
-pub struct OsmStandardTileUrlProvider;
-
-impl TileUrlProvider for OsmStandardTileUrlProvider {
-    fn url(&self, tile_id: TileId) -> String {
-        format!(
-            "https://tile.openstreetmap.org/{}/{}/{}.png",
-            tile_id.z, tile_id.x, tile_id.y
-        )
     }
 }
