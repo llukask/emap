@@ -108,6 +108,13 @@ mod tokio_loader {
     }
 
     #[cfg(feature = "tokio")]
+    impl Default for TokioTileLoader {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[cfg(feature = "tokio")]
     impl TileLoader for TokioTileLoader {
         fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>> {
             let t = self.tiles.lock().unwrap();

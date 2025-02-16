@@ -3,6 +3,7 @@ use std::{collections::HashMap, ops::Deref};
 use egui::{
     Color32, Context, CursorIcon, Id, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, Widget,
 };
+use egui::{Response, Ui};
 use geo::Point;
 
 mod tile_loader;
@@ -64,6 +65,28 @@ enum Shape {
     Circle(Point<f64>, f32, Option<Stroke>, Option<Color32>),
 }
 
+pub struct EMapResponse {
+    /// what `ui.add` returned
+    response: Response,
+
+    /// The position of the mouse in the map
+    pointer_position: Option<Point<f64>>,
+}
+
+impl EMapResponse {
+    pub fn pointer_position(&self) -> Option<Point<f64>> {
+        self.pointer_position
+    }
+}
+
+impl Deref for EMapResponse {
+    type Target = Response;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
 pub struct EMap<'t> {
     id: egui::Id,
     tile_url_provider: &'t dyn TileUrlProvider,
@@ -72,6 +95,8 @@ pub struct EMap<'t> {
     tile_size: f64,
 
     shapes: Vec<Shape>,
+
+    pointer_position: Option<Point<f64>>,
 }
 
 impl<'t> EMap<'t> {
@@ -84,6 +109,8 @@ impl<'t> EMap<'t> {
             tile_size: 256.0,
 
             shapes: Vec::new(),
+
+            pointer_position: None,
         }
     }
 
@@ -152,7 +179,7 @@ impl<'t> EMap<'t> {
 
     pub fn set_position(self, ctx: &Context, lat: f64, lon: f64, zoom: u8) -> Self {
         ctx.data_mut(|d| {
-            let s = d.get_temp_mut_or_insert_with::<EMapState>(self.id, || EMapState::new());
+            let s = d.get_temp_mut_or_insert_with::<EMapState>(self.id, EMapState::new);
 
             let p = Point::new(lon, lat);
             let coords = normalized_mercator(p);
@@ -164,56 +191,7 @@ impl<'t> EMap<'t> {
         self
     }
 
-    fn find_texture_handle(
-        &self,
-        tile: &TileId,
-        state: &mut EMapState,
-        ctx: &Context,
-    ) -> Option<(TextureHandle, Rect)> {
-        let texture_handle = state.registered_tile_textures.get(tile).cloned();
-        if let Some(h) = texture_handle {
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-            return Some((h, uv));
-        }
-
-        let url = self.tile_url_provider.url(*tile).to_string();
-
-        let loader: &dyn TileLoader = self
-            .tile_loader
-            .unwrap_or_else(|| DEFAULT_TILE_LOADER.deref());
-
-        let img_data = loader.tile(url, tile, ctx.clone());
-        if let Some(img_data) = img_data {
-            let h = ctx.load_texture(
-                format!("{:?}", tile),
-                img_data,
-                egui::TextureOptions::LINEAR,
-            );
-            state.registered_tile_textures.insert(*tile, h.clone());
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-            return Some((h, uv));
-        }
-
-        let (mut new_tile, mut new_uv) =
-            tile.zoom_out_with_uv(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
-        loop {
-            if new_tile.z == 0 {
-                break;
-            }
-
-            let texture_handle = state.registered_tile_textures.get(&new_tile).cloned();
-            if let Some(h) = texture_handle {
-                return Some((h, new_uv));
-            }
-            (new_tile, new_uv) = new_tile.zoom_out_with_uv(new_uv);
-        }
-
-        None
-    }
-}
-
-impl Widget for EMap<'_> {
-    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+    pub fn show(mut self, ui: &mut Ui) -> EMapResponse {
         let mut state = EMapState::load(ui.ctx(), self.id).unwrap_or_else(EMapState::new);
 
         let dy = ui.input(|r| r.raw_scroll_delta.y);
@@ -234,11 +212,11 @@ impl Widget for EMap<'_> {
 
         let n_rect = norm_rect(state.x, state.y, state.zoom, desired_tiles);
 
-        let r = ui
-            .interact(rect, self.id, Sense::drag().union(Sense::hover()))
+        let response = ui
+            .interact(rect, self.id, Sense::click_and_drag())
             .on_hover_cursor(CursorIcon::Grab);
 
-        if let Some(pos) = r.hover_pos() {
+        if let Some(pos) = response.hover_pos() {
             if dy.abs() >= 0.01 {
                 let pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
 
@@ -256,6 +234,11 @@ impl Widget for EMap<'_> {
 
                 ui.ctx().request_repaint();
             }
+
+            let pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
+            let pointer_merc = reverse_normalized_mercator(pointer_norm);
+
+            self.pointer_position = Some(pointer_merc);
         }
 
         // let a_zoom = ui
@@ -358,7 +341,7 @@ impl Widget for EMap<'_> {
             }
         }
 
-        let drag = r.drag_delta();
+        let drag = response.drag_delta();
         if drag != Vec2::ZERO {
             // input range x 0.0 .. w
             // output range x 0.0 .. (west - east)
@@ -376,7 +359,63 @@ impl Widget for EMap<'_> {
 
         state.store(ui.ctx(), self.id);
 
-        ui.response()
+        EMapResponse {
+            response,
+            pointer_position: self.pointer_position,
+        }
+    }
+
+    fn find_texture_handle(
+        &self,
+        tile: &TileId,
+        state: &mut EMapState,
+        ctx: &Context,
+    ) -> Option<(TextureHandle, Rect)> {
+        let texture_handle = state.registered_tile_textures.get(tile).cloned();
+        if let Some(h) = texture_handle {
+            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            return Some((h, uv));
+        }
+
+        let url = self.tile_url_provider.url(*tile).to_string();
+
+        let loader: &dyn TileLoader = self
+            .tile_loader
+            .unwrap_or_else(|| DEFAULT_TILE_LOADER.deref());
+
+        let img_data = loader.tile(url, tile, ctx.clone());
+        if let Some(img_data) = img_data {
+            let h = ctx.load_texture(
+                format!("{:?}", tile),
+                img_data,
+                egui::TextureOptions::LINEAR,
+            );
+            state.registered_tile_textures.insert(*tile, h.clone());
+            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+            return Some((h, uv));
+        }
+
+        let (mut new_tile, mut new_uv) =
+            tile.zoom_out_with_uv(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        loop {
+            if new_tile.z == 0 {
+                break;
+            }
+
+            let texture_handle = state.registered_tile_textures.get(&new_tile).cloned();
+            if let Some(h) = texture_handle {
+                return Some((h, new_uv));
+            }
+            (new_tile, new_uv) = new_tile.zoom_out_with_uv(new_uv);
+        }
+
+        None
+    }
+}
+
+impl Widget for EMap<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        self.show(ui).response
     }
 }
 
