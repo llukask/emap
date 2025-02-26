@@ -15,9 +15,8 @@
       in with pkgs; {
         devShells.default = mkShell rec {
           buildInputs = [
-            # Rust
             (pkgs.rust-bin.beta.latest.default.override {
-              extensions = [ "rust-analyzer" ];
+              extensions = [ "rust-analyzer" "rust-src" "rust-std" ];
             })
             trunk
 

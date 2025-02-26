@@ -242,10 +242,16 @@ mod tokio_loader {
     #[cfg(feature = "caching")]
     impl TileLoader for CachingTileLoader {
         fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>> {
-            let t = self.tiles.lock().unwrap();
+            let mut t = self.tiles.lock().unwrap();
             match t.get(tile_id) {
                 Some(Fetch::Pending) => None,
-                Some(Fetch::Done(c)) => Some(c.clone()),
+                Some(Fetch::Done(_)) => t.remove(tile_id).and_then(|f| {
+                    if let Fetch::Done(c) = f {
+                        Some(c)
+                    } else {
+                        None
+                    }
+                }),
                 None => {
                     self.tx.blocking_send((*tile_id, url, ctx)).unwrap();
                     None

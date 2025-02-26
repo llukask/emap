@@ -56,6 +56,13 @@ impl EMapState {
     fn store(self, ctx: &Context, id: Id) {
         ctx.data_mut(|d| d.insert_temp(id, self));
     }
+
+    fn unload_unused_textures(&mut self, visible_tiles: &[TileId]) {
+        let set = visible_tiles
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        self.registered_tile_textures.retain(|k, _| set.contains(k));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +292,7 @@ impl<'t> EMap<'t> {
                 painter.image(texture_handle.id(), r, uv, Color32::WHITE);
             }
         }
+        state.unload_unused_textures(&tiles);
 
         for shape in &self.shapes {
             match shape {

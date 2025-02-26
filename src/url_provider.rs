@@ -31,7 +31,7 @@ impl MapBoxTileUrlProvider {
 impl TileUrlProvider for MapBoxTileUrlProvider {
     fn url(&self, tile_id: TileId) -> String {
         format!(
-            "https://api.mapbox.com/styles/v1/{}/tiles/{}/{}/{}@2x?access_token={}",
+            "https://api.mapbox.com/styles/v1/{}/tiles/{}/{}/{}?access_token={}",
             self.style, tile_id.z, tile_id.x, tile_id.y, self.token
         )
     }
