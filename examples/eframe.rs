@@ -1,3 +1,7 @@
+//! Minimal eframe app demonstrating the `emap` widget: a map of Vienna with
+//! a fixed gold line and a user-editable red polyline (left-click to add a
+//! point, right-click to pop the last one).
+
 use egui::{Color32, Stroke};
 use emap::CachingTileLoader;
 use geo::Point;
@@ -7,6 +11,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::viewport::ViewportBuilder::default().with_title("emap example"),
         ..Default::default()
     };
+
+    // Persist tiles under ./cache so repeat launches don't re-download from OSM.
     let tile_loader = CachingTileLoader::new("./cache");
     eframe::run_native(
         "eframe template",
@@ -23,8 +29,11 @@ fn main() -> eframe::Result<()> {
 }
 
 struct EMapApp {
+    // Owned by the app so it outlives every per-frame `EMap` builder; the
+    // widget only borrows it.
     tile_loader: CachingTileLoader,
 
+    /// Polyline points collected from user clicks, in lon/lat.
     points: Vec<Point<f64>>,
 }
 
@@ -34,6 +43,8 @@ impl eframe::App for EMapApp {
             let line_start = Point::new(16.340083, 48.179349);
             let line_end = Point::new(16.341451, 48.176684);
 
+            // `initial_position` only applies on the first frame, so panning
+            // and zooming the map afterwards is preserved across updates.
             let mut map = emap::EMap::new("map")
                 .initial_position(ctx, 48.178993463351695, 16.340540441879874, 12)
                 .tile_size(256.0)
@@ -51,6 +62,7 @@ impl eframe::App for EMapApp {
             map = map.line_string(self.points.clone(), Stroke::new(2.0, Color32::GREEN));
 
             let r = map.show(ui);
+            // Left-click appends the cursor's geographic position; right-click pops.
             if r.clicked() {
                 if let Some(pos) = r.pointer_position() {
                     self.points.push(pos);
