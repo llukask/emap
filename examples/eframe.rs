@@ -55,6 +55,19 @@ impl eframe::App for EMapApp {
                 Stroke::new(4.0, Color32::GOLD.gamma_multiply(0.75)),
             );
 
+            // Small filled triangle near the gold line so the polygon
+            // primitive has a visible demonstration on screen.
+            let triangle = vec![
+                Point::new(16.339_000, 48.180_000),
+                Point::new(16.342_500, 48.179_500),
+                Point::new(16.340_500, 48.177_500),
+            ];
+            map = map.polygon(
+                triangle,
+                Some(Stroke::new(2.0, Color32::WHITE)),
+                Some(Color32::BLUE.gamma_multiply(0.35)),
+            );
+
             for p in &self.points {
                 map = map.filled_circle(*p, 10.0, Color32::RED);
             }

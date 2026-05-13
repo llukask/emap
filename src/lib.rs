@@ -113,6 +113,10 @@ enum Shape {
     /// Circle in screen-space pixels, anchored at a geographic point.
     /// `stroke` and `fill` are independently optional.
     Circle(Point<f64>, f32, Option<Stroke>, Option<Color32>),
+    /// Single-ring polygon through an arbitrary sequence of geographic points.
+    /// `stroke` and `fill` are independently optional. egui closes the ring
+    /// automatically (last point connects back to the first).
+    Polygon(Vec<Point<f64>>, Option<Stroke>, Option<Color32>),
 }
 
 /// Result of showing the map widget for one frame.
@@ -273,6 +277,44 @@ impl<'t> EMap<'t> {
     /// Add an outline-only circle of `radius` pixels at `center` (lon/lat).
     pub fn stroke_circle(self, center: Point<f64>, radius: f32, stroke: Stroke) -> Self {
         self.circle(center, radius, Some(stroke), None)
+    }
+
+    /// Add a single-ring polygon overlay with independently optional stroke
+    /// and fill.
+    ///
+    /// `points` is a sequence of geographic points (lon/lat). The ring is
+    /// closed implicitly by the renderer — do not duplicate the first point
+    /// at the end.
+    ///
+    /// **Note:** the underlying egui draw call (`Shape::convex_polygon`) only
+    /// fills convex rings correctly; non-convex or self-intersecting
+    /// polygons will draw their stroke as expected but render an undefined
+    /// fill. Use [`stroke_polygon`](Self::stroke_polygon) for arbitrary
+    /// outlines.
+    ///
+    /// Prefer the convenience constructors [`filled_polygon`](Self::filled_polygon)
+    /// or [`stroke_polygon`](Self::stroke_polygon) for the common cases.
+    pub fn polygon(
+        mut self,
+        points: Vec<Point<f64>>,
+        stroke: Option<Stroke>,
+        fill: Option<Color32>,
+    ) -> Self {
+        self.shapes.push(Shape::Polygon(points, stroke, fill));
+        self
+    }
+
+    /// Add a solid-filled polygon through `points` (lon/lat). Convex only;
+    /// see [`polygon`](Self::polygon) for the caveat on non-convex rings.
+    pub fn filled_polygon(self, points: Vec<Point<f64>>, fill: Color32) -> Self {
+        self.polygon(points, None, Some(fill))
+    }
+
+    /// Add an outline-only closed polygon through `points` (lon/lat). Works
+    /// for arbitrary rings (the convex-fill caveat does not apply when there
+    /// is no fill).
+    pub fn stroke_polygon(self, points: Vec<Point<f64>>, stroke: Stroke) -> Self {
+        self.polygon(points, Some(stroke), None)
     }
 
     /// Discard any persisted pan/zoom state for this widget id.
@@ -466,6 +508,29 @@ impl<'t> EMap<'t> {
                         let stroke = stroke.unwrap();
                         painter.circle_stroke(center, radius, stroke);
                     }
+                }
+                Shape::Polygon(points, stroke, fill) => {
+                    let pts = points
+                        .iter()
+                        .map(|p| {
+                            let p = normalized_mercator(*p);
+                            Pos2::new(
+                                scale(p.x(), east, west, vx_min, vx_max) as f32,
+                                scale(p.y(), south, north, vy_min, vy_max) as f32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    // egui::Shape::convex_polygon handles both fill (when
+                    // convex) and stroke in a single draw call; missing
+                    // fill/stroke degrade to TRANSPARENT / Stroke::NONE.
+                    let fill_color = fill.unwrap_or(Color32::TRANSPARENT);
+                    let path_stroke = stroke.unwrap_or(Stroke::NONE);
+                    painter.add(egui::Shape::convex_polygon(
+                        pts,
+                        fill_color,
+                        path_stroke,
+                    ));
                 }
             }
         }
