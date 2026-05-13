@@ -1,4 +1,5 @@
 cache
+cache-mapbox
 .direnv/
 target/
 cache-mapbox/
