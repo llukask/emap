@@ -88,13 +88,17 @@ impl EMapState {
         ctx.data_mut(|d| d.insert_temp(id, self));
     }
 
-    /// Drop cached textures for tiles outside the current viewport.
+    /// Drop cached textures for tiles outside the supplied retain set.
     ///
-    /// Called once per frame after drawing so VRAM usage stays proportional to
-    /// the visible area rather than growing with every panned-over tile.
-    fn unload_unused_textures(&mut self, visible_tiles: &[TileId]) {
-        let set = visible_tiles
-            .iter()
+    /// Called once per frame after drawing so VRAM usage stays proportional
+    /// to the visible area rather than growing with every panned-over tile.
+    /// The retain set is the union of the currently-visible tiles and any
+    /// preloaded adjacent-zoom tiles, so cross-level transitions don't
+    /// flicker as previously-current textures get evicted on the same frame
+    /// they would otherwise be reused as pyramid fallbacks.
+    fn unload_unused_textures<'a>(&mut self, retain: impl IntoIterator<Item = &'a TileId>) {
+        let set = retain
+            .into_iter()
             .collect::<std::collections::HashSet<_>>();
         self.registered_tile_textures.retain(|k, _| set.contains(k));
     }
@@ -471,12 +475,27 @@ impl<'t> EMap<'t> {
         // Padding of 2 fetches an extra ring of tiles outside the viewport
         // so panning doesn't reveal an unloaded edge while requests are in
         // flight.
-        let tiles = TileId::from_bounds(
-            reverse_normalized_mercator(Point::new(east as f64, north as f64)),
-            reverse_normalized_mercator(Point::new(west as f64, south as f64)),
-            state.zoom as u8,
-            2,
-        );
+        let current_z = state.zoom as u8;
+        let bounds_tl =
+            reverse_normalized_mercator(Point::new(east as f64, north as f64));
+        let bounds_br =
+            reverse_normalized_mercator(Point::new(west as f64, south as f64));
+        let tiles = TileId::from_bounds(bounds_tl, bounds_br, current_z, 2);
+
+        // Speculative cross-zoom preload: warm the tiles at z-1 and z+1 so a
+        // fractional-zoom crossing finds adjacent-level textures already
+        // resident on the GPU instead of evicted, eliminating the blank
+        // frame that the pyramid-up fallback can't otherwise cover.
+        let preload_parent = if current_z > 0 {
+            TileId::from_bounds(bounds_tl, bounds_br, current_z - 1, 2)
+        } else {
+            Vec::new()
+        };
+        let preload_child = if current_z < u8::MAX {
+            TileId::from_bounds(bounds_tl, bounds_br, current_z + 1, 2)
+        } else {
+            Vec::new()
+        };
 
         for tile in &tiles {
             let top_left = tile.top_left_normalized();
@@ -498,7 +517,21 @@ impl<'t> EMap<'t> {
                 painter.image(texture_handle.id(), r, uv, Color32::WHITE);
             }
         }
-        state.unload_unused_textures(&tiles);
+
+        // Issue warming fetches for adjacent-zoom tiles. Discards the
+        // returned handle/UV: these tiles are not painted this frame, but
+        // their textures land in state.registered_tile_textures and are
+        // kept alive by the retain set passed to unload_unused_textures.
+        for tile in preload_parent.iter().chain(preload_child.iter()) {
+            let _ = self.find_texture_handle(tile, &mut state, ui.ctx());
+        }
+
+        state.unload_unused_textures(
+            tiles
+                .iter()
+                .chain(preload_parent.iter())
+                .chain(preload_child.iter()),
+        );
 
         for shape in &self.shapes {
             match shape {
