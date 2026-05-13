@@ -36,6 +36,10 @@ let response = emap.render(
 - `cargo run --example winit` — standalone winit + wgpu host.
 - `cargo run --example eframe --features egui-wgpu` — embedded inside
   an eframe app via the `EmapHandle` helper.
+- `MAPBOX_TOKEN=pk.your_token cargo run --example mapbox --features egui-wgpu`
+  — same as the eframe example, but sources tiles from the Mapbox
+  Static Tiles API. Override the style with `MAPBOX_STYLE`
+  (default: `mapbox/streets-v12`).
 
 ## Feature flags
 

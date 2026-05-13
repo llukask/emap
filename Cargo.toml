@@ -56,3 +56,8 @@ path = "examples/winit.rs"
 name = "eframe"
 path = "examples/eframe.rs"
 required-features = ["egui-wgpu"]
+
+[[example]]
+name = "mapbox"
+path = "examples/mapbox.rs"
+required-features = ["egui-wgpu", "caching"]
