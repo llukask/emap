@@ -1,491 +1,461 @@
-//! Slippy-map widget for [egui](https://github.com/emilk/egui).
+//! Slippy-map renderer built on [`wgpu`].
 //!
 //! Renders raster tiles using the OSM/XYZ scheme on top of a Web-Mercator
-//! projection, with built-in panning, mouse-wheel zoom, and overlay shapes
-//! (lines, line strings, circles).
-//!
-//! The map is built as a builder-style [`Widget`]: configure tile source,
-//! initial position, and overlays, then call [`EMap::show`] (or pass the value
-//! to `ui.add`).
+//! projection, with overlay primitives (lines, line strings, circles, and
+//! polygons). Input handling, pan, and wheel-zoom logic live in the
+//! library; the renderer itself is "bring your own surface" — the caller
+//! supplies an active `wgpu::RenderPass` for the surface texture each
+//! frame.
 //!
 //! Tiles are fetched through a [`TileLoader`] (defaulting to an async
-//! [`TokioTileLoader`] when the `tokio` feature is enabled) and addressed via
-//! a [`TileUrlProvider`] (defaulting to [`OsmStandardTileUrlProvider`]).
+//! [`TokioTileLoader`] when the `tokio` feature is enabled) and addressed
+//! via a [`TileUrlProvider`] (defaulting to [`OsmStandardTileUrlProvider`]).
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! let mut emap = EMap::new(
+//!     &device,
+//!     surface_format,
+//!     Arc::new(move || window.request_redraw()),
+//! );
+//! emap.set_initial_position(52.5, 13.4, 8);
+//!
+//! // Each frame:
+//! let response = emap.render(
+//!     &Frame {
+//!         device: &device,
+//!         queue: &queue,
+//!         viewport: Viewport { origin: glam::Vec2::ZERO, size: window_size },
+//!         input: Input { pointer_position: Some(mouse_xy), scroll_delta_y: dy, drag_delta },
+//!         shapes: &[],
+//!     },
+//!     &mut render_pass,
+//! );
+//! ```
 
-use std::{collections::HashMap, ops::Deref};
+use std::sync::Arc;
 
-use egui::{
-    Color32, Context, CursorIcon, Id, Pos2, Rect, Sense, Stroke, TextureHandle, Vec2, Widget,
-};
-use egui::{Response, Ui};
 use geo::Point;
+
+mod coords;
+mod overlays;
+mod tiles;
 
 mod tile_loader;
 mod url_provider;
 
-pub use crate::tile_loader::*;
-pub use crate::url_provider::*;
+#[cfg(feature = "egui-wgpu")]
+pub mod egui_wgpu;
 
-/// Per-widget state persisted across frames via `egui`'s temp data store.
-///
-/// Position is kept in normalized Mercator coordinates (`x, y ∈ [0, 1]`) so it
-/// is independent of the chosen tile size and zoom level. `zoom` is stored as
-/// `f64` to allow smooth wheel-driven interpolation between integer zoom
-/// levels.
-#[derive(Clone)]
-struct EMapState {
-    /// Current zoom level. Fractional values are valid during wheel zoom; the
-    /// integer floor selects which tile pyramid level to render.
-    zoom: f64,
+pub use coords::TileId;
+pub use tile_loader::*;
+pub use url_provider::*;
 
-    /// Map center, x in normalized Mercator space (`0.0` = 180°W, `1.0` = 180°E).
-    x: f64,
-    /// Map center, y in normalized Mercator space (`0.0` = north pole, `1.0` = south).
-    y: f64,
+use coords::{
+    norm_rect, normalized_mercator, reverse_normalized_mercator, scale, scale_rect, view_rect,
+    UvRect,
+};
+use overlays::{OverlayRenderer, OverlayShape};
+use tiles::{TileDraw, TileRenderer};
 
-    /// Cache of GPU-uploaded tile textures keyed by tile id. Entries are
-    /// evicted by [`EMapState::unload_unused_textures`] once the tile leaves
-    /// the viewport, keeping VRAM bounded.
-    registered_tile_textures: HashMap<TileId, TextureHandle>,
+// ─── Public types ──────────────────────────────────────────────────────────
+
+/// Straight (non-premultiplied) sRGB color with 8-bit channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
-impl EMapState {
-    /// Build state centered on a geographic coordinate at a given integer zoom.
-    fn with_initial_settings(lat: f64, lon: f64, zoom: u8) -> Self {
-        let p = Point::new(lon, lat);
-        let coords = normalized_mercator(p);
+impl Color {
+    pub const TRANSPARENT: Color = Color { r: 0, g: 0, b: 0, a: 0 };
+    pub const BLACK: Color = Color { r: 0, g: 0, b: 0, a: 255 };
+    pub const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
+    pub const RED: Color = Color { r: 255, g: 0, b: 0, a: 255 };
+    pub const GREEN: Color = Color { r: 0, g: 255, b: 0, a: 255 };
+    pub const BLUE: Color = Color { r: 0, g: 0, b: 255, a: 255 };
 
-        let x = coords.x();
-        let y = coords.y();
-
-        Self {
-            zoom: zoom as f64,
-            x,
-            y,
-
-            registered_tile_textures: HashMap::new(),
-        }
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
     }
-
-    /// Default state: world centered (`0,0` lat/lon) at zoom 1.
-    fn new() -> Self {
-        Self {
-            zoom: 1.0,
-            x: 0.5,
-            y: 0.5,
-
-            registered_tile_textures: HashMap::new(),
-        }
-    }
-
-    /// Load previously stored state for this widget id, if any.
-    fn load(ctx: &Context, id: Id) -> Option<Self> {
-        ctx.data_mut(|d| d.get_temp(id))
-    }
-
-    /// Persist this state for the next frame, keyed by widget id.
-    fn store(self, ctx: &Context, id: Id) {
-        ctx.data_mut(|d| d.insert_temp(id, self));
-    }
-
-    /// Drop cached textures for tiles outside the supplied retain set.
-    ///
-    /// Called once per frame after drawing so VRAM usage stays proportional
-    /// to the visible area rather than growing with every panned-over tile.
-    /// The retain set is the union of the currently-visible tiles and any
-    /// preloaded adjacent-zoom tiles, so cross-level transitions don't
-    /// flicker as previously-current textures get evicted on the same frame
-    /// they would otherwise be reused as pyramid fallbacks.
-    fn unload_unused_textures<'a>(&mut self, retain: impl IntoIterator<Item = &'a TileId>) {
-        let set = retain
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        self.registered_tile_textures.retain(|k, _| set.contains(k));
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b, a: 255 }
     }
 }
 
-/// Overlay primitives the map can draw on top of tiles.
+/// Outline style: width (in viewport pixels) and color.
+#[derive(Debug, Clone, Copy)]
+pub struct Stroke {
+    pub width: f32,
+    pub color: Color,
+}
+
+impl Stroke {
+    pub const NONE: Stroke = Stroke {
+        width: 0.0,
+        color: Color::TRANSPARENT,
+    };
+    pub const fn new(width: f32, color: Color) -> Self {
+        Self { width, color }
+    }
+}
+
+/// Pixel rectangle the renderer should paint into.
 ///
-/// Coordinates are kept in geographic (lon/lat) form and projected at draw
-/// time so overlays stay anchored when the user pans or zooms.
+/// `origin` is the top-left corner in surface pixels and `size` the width
+/// and height. The renderer issues `set_viewport` on the supplied
+/// `RenderPass`, so everything inside the library reasons in
+/// viewport-local pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct Viewport {
+    pub origin: glam::Vec2,
+    pub size: glam::Vec2,
+}
+
+/// Per-frame input state.
+///
+/// `pointer_position` is the cursor location in viewport-local pixels (top-
+/// left origin) or `None` when the cursor is outside or absent.
+/// `scroll_delta_y` is the raw wheel delta in egui-style units (positive ⇒
+/// zoom in). `drag_delta` is the cursor delta accumulated *while a drag
+/// button is held this frame*; pass `Vec2::ZERO` when no drag is in
+/// progress.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Input {
+    pub pointer_position: Option<glam::Vec2>,
+    pub scroll_delta_y: f32,
+    pub drag_delta: glam::Vec2,
+}
+
+/// Bundle of inputs the caller passes to [`EMap::render`].
+pub struct Frame<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    pub viewport: Viewport,
+    pub input: Input,
+    pub shapes: &'a [Shape],
+}
+
+/// Result of rendering one frame.
 #[derive(Debug, Clone)]
-enum Shape {
-    /// Single straight segment between two geographic points.
-    Line(Point<f64>, Point<f64>, Stroke),
-    /// Connected polyline through an arbitrary sequence of geographic points.
-    LineString(Vec<Point<f64>>, Stroke),
-    /// Circle in screen-space pixels, anchored at a geographic point.
-    /// `stroke` and `fill` are independently optional.
-    Circle(Point<f64>, f32, Option<Stroke>, Option<Color32>),
-    /// Single-ring polygon through an arbitrary sequence of geographic points.
-    /// `stroke` and `fill` are independently optional. egui closes the ring
-    /// automatically (last point connects back to the first).
-    Polygon(Vec<Point<f64>>, Option<Stroke>, Option<Color32>),
-}
-
-/// Result of showing the map widget for one frame.
-///
-/// Dereferences to the underlying egui [`Response`], so callers can use
-/// `.clicked()`, `.dragged()`, etc. directly. Adds map-specific data such as
-/// the cursor's geographic position and the current viewport.
 pub struct EMapResponse {
-    /// The egui interaction response for the allocated map rectangle.
-    response: Response,
-
-    /// Geographic position (lon/lat) under the mouse cursor, if hovering.
     pointer_position: Option<Point<f64>>,
-
-    /// Geographic rectangle (lon/lat) covering the on-screen UI rectangle.
     visible_bounds: geo::Rect<f64>,
-
-    /// Geographic rectangle (lon/lat) covering the centered square the
-    /// projection actually spans. Wider than `visible_bounds` when the UI
-    /// rectangle is non-square; matches the area tiles are fetched for.
     projected_bounds: geo::Rect<f64>,
-
-    /// Map center (lon/lat).
     center: Point<f64>,
-
-    /// Current zoom level (fractional during interactive wheel zoom).
     zoom: f64,
 }
 
 impl EMapResponse {
-    /// Geographic position (lon/lat) under the mouse cursor on this frame.
-    ///
-    /// Returns `None` when the cursor is outside the map rectangle.
+    /// Geographic position (lon/lat) under the cursor this frame, or `None`
+    /// when the cursor is outside the map.
     pub fn pointer_position(&self) -> Option<Point<f64>> {
         self.pointer_position
     }
-
-    /// Geographic bounds (lon/lat) of exactly what the user sees on screen.
-    ///
-    /// Use this to cull markers, fetch external data for the viewport, or
-    /// drive a coordinate readout. At very low zoom levels with horizontal
-    /// panning the rectangle can technically span more than 360° of
-    /// longitude; callers that care should normalize the result.
+    /// Geographic bounds (lon/lat) of exactly what's on screen.
     pub fn visible_bounds(&self) -> geo::Rect<f64> {
         self.visible_bounds
     }
-
-    /// Geographic bounds (lon/lat) of the centered square the projection
-    /// covers. This is the area the tile loader is asked about every frame
-    /// and is therefore a superset of [`visible_bounds`](Self::visible_bounds)
-    /// whenever the host UI rectangle is non-square.
+    /// Geographic bounds of the centered projection square (a superset of
+    /// [`visible_bounds`](Self::visible_bounds) when the viewport is
+    /// non-square).
     pub fn projected_bounds(&self) -> geo::Rect<f64> {
         self.projected_bounds
     }
-
     /// Map center (lon/lat) at the end of this frame.
     pub fn center(&self) -> Point<f64> {
         self.center
     }
-
-    /// Current zoom level. Integer values are conventional XYZ levels; the
-    /// fractional part appears during interactive wheel zoom.
+    /// Current zoom level (fractional during interactive wheel zoom).
     pub fn zoom(&self) -> f64 {
         self.zoom
     }
 }
 
-impl Deref for EMapResponse {
-    type Target = Response;
-
-    fn deref(&self) -> &Self::Target {
-        &self.response
-    }
+/// Overlay primitives the map can draw on top of tiles. All coordinates are
+/// geographic and projected to screen at draw time.
+#[derive(Debug, Clone)]
+pub enum Shape {
+    Line(Point<f64>, Point<f64>, Stroke),
+    LineString(Vec<Point<f64>>, Stroke),
+    Circle(Point<f64>, f32, Option<Stroke>, Option<Color>),
+    Polygon(Vec<Point<f64>>, Option<Stroke>, Option<Color>),
 }
 
-/// Builder-style egui widget that renders a slippy map.
-///
-/// Configure the source (via [`tile_url_provider`](Self::tile_url_provider)
-/// and [`tile_loader`](Self::tile_loader)), the initial view (via
-/// [`initial_position`](Self::initial_position)), and any overlays
-/// ([`line`](Self::line), [`line_string`](Self::line_string),
-/// [`filled_circle`](Self::filled_circle), …), then call
-/// [`show`](Self::show) or add the widget to a `Ui`.
-///
-/// The widget keeps persistent state (zoom + center) keyed by the `id` passed
-/// to [`new`](Self::new), so multiple maps can coexist within the same UI.
-pub struct EMap<'t> {
-    /// Stable identity used to look up persisted [`EMapState`] across frames.
-    id: egui::Id,
-    /// Strategy for turning a [`TileId`] into a fetch URL.
-    tile_url_provider: &'t dyn TileUrlProvider,
-    /// Optional override for the loader; defaults to [`DEFAULT_TILE_LOADER`].
-    tile_loader: Option<&'t dyn TileLoader>,
-
-    /// Tile edge length in screen pixels at integer zoom levels.
-    tile_size: f64,
-
-    /// Overlay primitives drawn after the tiles.
-    shapes: Vec<Shape>,
-
-    /// Geographic cursor position, computed during [`show`](Self::show) and
-    /// exposed back to the caller via [`EMapResponse`].
-    pointer_position: Option<Point<f64>>,
-}
-
-impl<'t> EMap<'t> {
-    /// Create a new map widget.
-    ///
-    /// `id` is hashed into an [`egui::Id`] and used to persist pan/zoom state
-    /// between frames; use distinct ids if you show more than one map.
-    ///
-    /// Defaults: OpenStreetMap standard tile URLs, [`DEFAULT_TILE_LOADER`],
-    /// 256 px tiles, no overlays, world-centered at zoom 1.
-    pub fn new(id: impl std::hash::Hash) -> Self {
-        Self {
-            id: Id::new(id),
-            tile_url_provider: &OsmStandardTileUrlProvider,
-            tile_loader: None,
-
-            tile_size: 256.0,
-
-            shapes: Vec::new(),
-
-            pointer_position: None,
-        }
+impl Shape {
+    pub fn line(start: Point<f64>, end: Point<f64>, stroke: Stroke) -> Self {
+        Shape::Line(start, end, stroke)
     }
-
-    /// Seed the map's center and zoom **only on first show**.
-    ///
-    /// If persisted state already exists for this widget's id, this is a
-    /// no-op so user pan/zoom isn't clobbered every frame. Use
-    /// [`set_position`](Self::set_position) to force-update an existing view.
-    pub fn initial_position(self, ctx: &Context, lat: f64, lon: f64, zoom: u8) -> Self {
-        let id = self.id;
-        let state = EMapState::with_initial_settings(lat, lon, zoom);
-        ctx.data_mut(|d| {
-            if d.get_temp::<EMapState>(self.id).is_none() {
-                d.insert_temp(id, state);
-            }
-        });
-        self
+    pub fn line_string(points: Vec<Point<f64>>, stroke: Stroke) -> Self {
+        Shape::LineString(points, stroke)
     }
-
-    /// Set the on-screen edge length of one tile, in pixels.
-    ///
-    /// The number of tiles fetched per frame scales inversely with this — a
-    /// smaller value packs more (sharper) tiles into the same viewport at the
-    /// cost of more requests.
-    pub fn tile_size(mut self, size: f64) -> Self {
-        self.tile_size = size;
-        self
-    }
-
-    /// Add a straight line overlay between two geographic points.
-    pub fn line(mut self, start: Point<f64>, end: Point<f64>, stroke: Stroke) -> Self {
-        self.shapes.push(Shape::Line(start, end, stroke));
-        self
-    }
-
-    /// Add a polyline overlay through a sequence of geographic points.
-    pub fn line_string(mut self, points: Vec<Point<f64>>, stroke: Stroke) -> Self {
-        self.shapes.push(Shape::LineString(points, stroke));
-        self
-    }
-
-    /// Override the tile URL strategy (defaults to OpenStreetMap standard).
-    pub fn tile_url_provider(mut self, provider: &'t dyn TileUrlProvider) -> Self {
-        self.tile_url_provider = provider;
-        self
-    }
-
-    /// Override the tile loader (defaults to [`DEFAULT_TILE_LOADER`]).
-    ///
-    /// Supply a [`CachingTileLoader`] to persist tiles on disk between runs.
-    pub fn tile_loader(mut self, loader: &'t dyn TileLoader) -> Self {
-        self.tile_loader = Some(loader);
-        self
-    }
-
-    /// Add a circle overlay with independently optional stroke and fill.
-    ///
-    /// Prefer the convenience constructors [`filled_circle`](Self::filled_circle)
-    /// or [`stroke_circle`](Self::stroke_circle) for the common cases.
     pub fn circle(
-        mut self,
         center: Point<f64>,
         radius: f32,
         stroke: Option<Stroke>,
-        fill: Option<Color32>,
+        fill: Option<Color>,
     ) -> Self {
-        self.shapes
-            .push(Shape::Circle(center, radius, stroke, fill));
-        self
+        Shape::Circle(center, radius, stroke, fill)
     }
-
-    /// Add a solid-filled circle of `radius` pixels at `center` (lon/lat).
-    pub fn filled_circle(self, center: Point<f64>, radius: f32, fill: Color32) -> Self {
-        self.circle(center, radius, None, Some(fill))
+    pub fn filled_circle(center: Point<f64>, radius: f32, fill: Color) -> Self {
+        Shape::Circle(center, radius, None, Some(fill))
     }
-
-    /// Add an outline-only circle of `radius` pixels at `center` (lon/lat).
-    pub fn stroke_circle(self, center: Point<f64>, radius: f32, stroke: Stroke) -> Self {
-        self.circle(center, radius, Some(stroke), None)
+    pub fn stroke_circle(center: Point<f64>, radius: f32, stroke: Stroke) -> Self {
+        Shape::Circle(center, radius, Some(stroke), None)
     }
-
-    /// Add a single-ring polygon overlay with independently optional stroke
-    /// and fill.
-    ///
-    /// `points` is a sequence of geographic points (lon/lat). The ring is
-    /// closed implicitly by the renderer — do not duplicate the first point
-    /// at the end.
-    ///
-    /// **Note:** the underlying egui draw call (`Shape::convex_polygon`) only
-    /// fills convex rings correctly; non-convex or self-intersecting
-    /// polygons will draw their stroke as expected but render an undefined
-    /// fill. Use [`stroke_polygon`](Self::stroke_polygon) for arbitrary
-    /// outlines.
-    ///
-    /// Prefer the convenience constructors [`filled_polygon`](Self::filled_polygon)
-    /// or [`stroke_polygon`](Self::stroke_polygon) for the common cases.
+    /// Polygon with independently optional stroke and fill. Unlike the
+    /// previous egui-based implementation, lyon fills any simple polygon
+    /// (convex or not) correctly.
     pub fn polygon(
-        mut self,
         points: Vec<Point<f64>>,
         stroke: Option<Stroke>,
-        fill: Option<Color32>,
+        fill: Option<Color>,
     ) -> Self {
-        self.shapes.push(Shape::Polygon(points, stroke, fill));
-        self
+        Shape::Polygon(points, stroke, fill)
+    }
+    pub fn filled_polygon(points: Vec<Point<f64>>, fill: Color) -> Self {
+        Shape::Polygon(points, None, Some(fill))
+    }
+    pub fn stroke_polygon(points: Vec<Point<f64>>, stroke: Stroke) -> Self {
+        Shape::Polygon(points, Some(stroke), None)
+    }
+}
+
+// ─── Internal state ────────────────────────────────────────────────────────
+
+/// Pan + zoom state. Kept in normalized Mercator space (`x, y ∈ [0, 1]`).
+#[derive(Debug, Clone)]
+struct EMapState {
+    zoom: f64,
+    x: f64,
+    y: f64,
+}
+
+impl EMapState {
+    fn new() -> Self {
+        Self {
+            zoom: 1.0,
+            x: 0.5,
+            y: 0.5,
+        }
     }
 
-    /// Add a solid-filled polygon through `points` (lon/lat). Convex only;
-    /// see [`polygon`](Self::polygon) for the caveat on non-convex rings.
-    pub fn filled_polygon(self, points: Vec<Point<f64>>, fill: Color32) -> Self {
-        self.polygon(points, None, Some(fill))
+    fn with_position(lat: f64, lon: f64, zoom: u8) -> Self {
+        let coords = normalized_mercator(Point::new(lon, lat));
+        Self {
+            zoom: zoom as f64,
+            x: coords.x(),
+            y: coords.y(),
+        }
     }
+}
 
-    /// Add an outline-only closed polygon through `points` (lon/lat). Works
-    /// for arbitrary rings (the convex-fill caveat does not apply when there
-    /// is no fill).
-    pub fn stroke_polygon(self, points: Vec<Point<f64>>, stroke: Stroke) -> Self {
-        self.polygon(points, Some(stroke), None)
-    }
+// ─── EMap ──────────────────────────────────────────────────────────────────
 
-    /// Discard any persisted pan/zoom state for this widget id.
+/// Slippy-map renderer.
+///
+/// Owns the wgpu pipelines, the GPU tile-texture cache, and the persistent
+/// pan/zoom state. Call [`EMap::render`] once per frame inside an active
+/// render pass for the surface texture.
+pub struct EMap {
+    state: EMapState,
+    /// Set once the user has positioned the map (via either
+    /// [`set_initial_position`](Self::set_initial_position) or
+    /// [`set_position`](Self::set_position)). Distinguishes "default view
+    /// because user hasn't said anything yet" from "user explicitly chose
+    /// 0,0 zoom 1".
+    positioned: bool,
+
+    tile_url_provider: Arc<dyn TileUrlProvider>,
+    tile_loader: Arc<dyn TileLoader>,
+    tile_size: f64,
+
+    tile_renderer: TileRenderer,
+    overlay_renderer: OverlayRenderer,
+
+    /// Capture given to async loaders so they can wake the host when a
+    /// tile finishes loading.
+    repaint: RepaintSignal,
+
+    /// Wall-clock reference for animating the loading indicator.
+    start: std::time::Instant,
+    /// Whether to draw a pulsing dot over tiles being fetched.
+    show_loading_indicator: bool,
+}
+
+impl EMap {
+    /// Build a renderer.
     ///
-    /// The next frame will fall back to the default view (or to
-    /// [`initial_position`](Self::initial_position) if also configured).
-    pub fn clear_state(self, ctx: &Context) -> Self {
-        ctx.data_mut(|d| {
-            d.remove::<EMapState>(self.id);
-        });
-        self
+    /// `target_format` must match the texture format of the render pass
+    /// the caller will later supply. `repaint` is invoked by async tile
+    /// loaders when a tile is ready — wire it to the host's redraw
+    /// mechanism (e.g. `window.request_redraw()` on winit).
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        repaint: RepaintSignal,
+    ) -> Self {
+        Self {
+            state: EMapState::new(),
+            positioned: false,
+            tile_url_provider: Arc::new(OsmStandardTileUrlProvider),
+            tile_loader: DEFAULT_TILE_LOADER.clone(),
+            tile_size: 256.0,
+            tile_renderer: TileRenderer::new(device, target_format),
+            overlay_renderer: OverlayRenderer::new(device, target_format),
+            repaint,
+            start: std::time::Instant::now(),
+            show_loading_indicator: true,
+        }
     }
 
-    /// Force-update the persisted center and zoom, overwriting user input.
-    ///
-    /// Unlike [`initial_position`](Self::initial_position), this applies every
-    /// frame it is called — useful for "fly to" commands or external control.
-    pub fn set_position(self, ctx: &Context, lat: f64, lon: f64, zoom: u8) -> Self {
-        ctx.data_mut(|d| {
-            let s = d.get_temp_mut_or_insert_with::<EMapState>(self.id, EMapState::new);
-
-            let p = Point::new(lon, lat);
-            let coords = normalized_mercator(p);
-
-            s.x = coords.x();
-            s.y = coords.y();
-            s.zoom = zoom as f64;
-        });
-        self
+    /// Enable or disable the pulsing dot drawn over tiles being loaded.
+    pub fn set_loading_indicator(&mut self, enabled: bool) {
+        self.show_loading_indicator = enabled;
     }
 
-    /// Allocate space, draw the tiles + overlays, and process input.
+    /// Override the URL provider (default: OpenStreetMap).
+    pub fn set_tile_url_provider(&mut self, provider: Arc<dyn TileUrlProvider>) {
+        self.tile_url_provider = provider;
+    }
+
+    /// Override the tile loader (default: [`DEFAULT_TILE_LOADER`]).
+    pub fn set_tile_loader(&mut self, loader: Arc<dyn TileLoader>) {
+        self.tile_loader = loader;
+    }
+
+    /// Set the on-screen edge length of one tile in viewport pixels.
+    pub fn set_tile_size(&mut self, size: f64) {
+        self.tile_size = size;
+    }
+
+    /// Seed center + zoom only on first show.
     ///
-    /// The widget claims the [`Ui`]'s available size, so put it inside a panel
-    /// or sized container. Returns an [`EMapResponse`] that dereferences to
-    /// the underlying egui [`Response`] for click/drag detection and exposes
-    /// the cursor's geographic position via
-    /// [`pointer_position`](EMapResponse::pointer_position).
-    pub fn show(mut self, ui: &mut Ui) -> EMapResponse {
-        let mut state = EMapState::load(ui.ctx(), self.id).unwrap_or_else(EMapState::new);
+    /// No-op once the user has interacted or [`set_position`](Self::set_position)
+    /// has been called.
+    pub fn set_initial_position(&mut self, lat: f64, lon: f64, zoom: u8) {
+        if !self.positioned {
+            self.state = EMapState::with_position(lat, lon, zoom);
+            self.positioned = true;
+        }
+    }
 
-        let dy = ui.input(|r| r.raw_scroll_delta.y);
+    /// Force-update the persisted center and zoom.
+    pub fn set_position(&mut self, lat: f64, lon: f64, zoom: u8) {
+        self.state = EMapState::with_position(lat, lon, zoom);
+        self.positioned = true;
+    }
 
-        let (_id, rect) = ui.allocate_space(ui.available_size());
+    /// Clear pan/zoom state (returns to default world-centered view).
+    pub fn clear_state(&mut self) {
+        self.state = EMapState::new();
+        self.positioned = false;
+    }
 
-        let painter = ui.painter_at(rect);
-
-        let w = rect.width() as f64;
-        let h = rect.height() as f64;
-
-        let pixel_tile_width = self.tile_size;
-
+    /// Project a viewport-local pixel position to geographic (lon/lat).
+    ///
+    /// Reflects the most-recently-rendered state — i.e. the answer matches
+    /// what the cursor pointed at on the previous frame. Useful for click
+    /// handlers that need to convert mouse coordinates before the next
+    /// [`render`](Self::render) call.
+    pub fn screen_to_geo(&self, pixel: glam::Vec2, viewport: Viewport) -> Point<f64> {
+        let w = viewport.size.x as f64;
+        let h = viewport.size.y as f64;
         let major = w.max(h);
-        let view_rect = view_rect(w, h);
+        let desired_tiles = major / self.tile_size;
+        let view = view_rect(w, h);
+        let n_rect = norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
+        let pos = Point::new(pixel.x as f64, pixel.y as f64);
+        let pointer_norm = scale_rect(pos, view, n_rect);
+        reverse_normalized_mercator(pointer_norm)
+    }
 
+    /// Render one frame.
+    pub fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> EMapResponse {
+        let Frame {
+            device,
+            queue,
+            viewport,
+            input,
+            shapes,
+        } = *frame;
+
+        // Restrict draws (and clears) to the requested viewport rect.
+        pass.set_viewport(
+            viewport.origin.x,
+            viewport.origin.y,
+            viewport.size.x,
+            viewport.size.y,
+            0.0,
+            1.0,
+        );
+
+        let w = viewport.size.x as f64;
+        let h = viewport.size.y as f64;
+        let major = w.max(h);
+        let pixel_tile_width = self.tile_size;
         let desired_tiles = major / pixel_tile_width;
+        let view = view_rect(w, h);
+        let n_rect = norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
 
-        let n_rect = norm_rect(state.x, state.y, state.zoom, desired_tiles);
+        // ── Apply wheel zoom ───────────────────────────────────────────
+        if let Some(pos) = input.pointer_position
+            && input.scroll_delta_y.abs() >= 0.01
+        {
+            // Zoom-toward-cursor: keep the geographic point under the
+            // cursor anchored across the zoom change.
+            let pos_geo = Point::new(pos.x as f64, pos.y as f64);
+            let pointer_norm = scale_rect(pos_geo, view, n_rect);
 
-        let response = ui
-            .interact(rect, self.id, Sense::click_and_drag())
-            .on_hover_cursor(CursorIcon::Grab);
+            self.state.zoom += input.scroll_delta_y as f64 * 0.01;
+            self.state.zoom = self.state.zoom.clamp(0.75, 20.1);
 
-        if let Some(pos) = response.hover_pos() {
-            if dy.abs() >= 0.01 {
-                // Zoom-toward-cursor: capture the geographic point under the
-                // cursor *before* changing zoom, then translate the center so
-                // that same geographic point ends up under the cursor again
-                // after the new zoom is applied. This matches the behaviour
-                // of mainstream slippy maps (Google Maps, Leaflet, …).
-                let pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
+            let n_rect2 =
+                norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
+            let new_pointer_norm = scale_rect(pos_geo, view, n_rect2);
+            let diff = pointer_norm - new_pointer_norm;
+            self.state.x += diff.x();
+            self.state.y += diff.y();
 
-                state.zoom += (dy as f64) * 0.01;
-                state.zoom = state.zoom.clamp(0.75, 20.1);
-
-                let n_rect = norm_rect(state.x, state.y, state.zoom, desired_tiles);
-
-                let new_pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
-
-                let desired_diff = pointer_norm - new_pointer_norm;
-
-                state.x += desired_diff.x();
-                state.y += desired_diff.y();
-
-                ui.ctx().request_repaint();
-            }
-
-            let pointer_norm = scale_rect(geo_from_pos2(pos), view_rect, n_rect);
-            let pointer_merc = reverse_normalized_mercator(pointer_norm);
-
-            self.pointer_position = Some(pointer_merc);
+            (self.repaint)();
         }
 
-        // let a_zoom = ui
-        //     .ctx()
-        //     .animate_value_with_time("zoom".into(), state.zoom as f32, 0.5);
-        // let n_rect = norm_rect(state.x, state.y, state.zoom, desired_tiles);
+        // Recompute after potential zoom change.
+        let n_rect = norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
 
-        ui.ctx().output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+        // Pointer in geographic space for the response.
+        let pointer_position = input.pointer_position.map(|pos| {
+            let pos_geo = Point::new(pos.x as f64, pos.y as f64);
+            let pointer_norm = scale_rect(pos_geo, view, n_rect);
+            reverse_normalized_mercator(pointer_norm)
+        });
 
         let east = n_rect.min().x;
         let west = n_rect.max().x;
         let north = n_rect.max().y;
         let south = n_rect.min().y;
 
-        let vx_min = view_rect.min().x;
-        let vx_max = view_rect.max().x;
-        let vy_min = view_rect.min().y;
-        let vy_max = view_rect.max().y;
+        let vx_min = view.min().x;
+        let vx_max = view.max().x;
+        let vy_min = view.min().y;
+        let vy_max = view.max().y;
 
-        // Padding of 2 fetches an extra ring of tiles outside the viewport
-        // so panning doesn't reveal an unloaded edge while requests are in
-        // flight.
-        let current_z = state.zoom as u8;
-        let bounds_tl =
-            reverse_normalized_mercator(Point::new(east as f64, north as f64));
-        let bounds_br =
-            reverse_normalized_mercator(Point::new(west as f64, south as f64));
+        let current_z = self.state.zoom as u8;
+        let bounds_tl = reverse_normalized_mercator(Point::new(east, north));
+        let bounds_br = reverse_normalized_mercator(Point::new(west, south));
+        // Padding=2 fetches an extra ring of tiles outside the viewport so
+        // panning doesn't reveal an unloaded edge while requests are in flight.
         let tiles = TileId::from_bounds(bounds_tl, bounds_br, current_z, 2);
 
-        // Speculative cross-zoom preload: warm the tiles at z-1 and z+1 so a
-        // fractional-zoom crossing finds adjacent-level textures already
-        // resident on the GPU instead of evicted, eliminating the blank
-        // frame that the pyramid-up fallback can't otherwise cover.
+        // Cross-zoom preload — warm both the loader and the GPU cache so
+        // fractional-zoom crossings find adjacent-level textures resident.
         let preload_parent = if current_z > 0 {
             TileId::from_bounds(bounds_tl, bounds_br, current_z - 1, 2)
         } else {
@@ -497,474 +467,269 @@ impl<'t> EMap<'t> {
             Vec::new()
         };
 
+        // ── Build the visible tile draw list ──────────────────────────
+        let mut draws: Vec<TileDraw> = Vec::with_capacity(tiles.len());
+        let mut loading_rects: Vec<(glam::Vec2, glam::Vec2)> = Vec::new();
         for tile in &tiles {
-            let top_left = tile.top_left_normalized();
-            let bottom_right = tile.bottom_right_normalized();
-            let r = Rect::from_min_max(
-                Pos2::new(
-                    scale(top_left.x(), east, west, vx_min, vx_max) as f32,
-                    scale(top_left.y(), south, north, vy_min, vy_max) as f32,
-                ),
-                Pos2::new(
-                    scale(bottom_right.x(), east, west, vx_min, vx_max) as f32,
-                    scale(bottom_right.y(), south, north, vy_min, vy_max) as f32,
-                ),
+            let tl = tile.top_left_normalized();
+            let br = tile.bottom_right_normalized();
+            let rect_min = glam::Vec2::new(
+                scale(tl.x(), east, west, vx_min, vx_max) as f32,
+                scale(tl.y(), south, north, vy_min, vy_max) as f32,
+            );
+            let rect_max = glam::Vec2::new(
+                scale(br.x(), east, west, vx_min, vx_max) as f32,
+                scale(br.y(), south, north, vy_min, vy_max) as f32,
             );
 
-            let texture_handle = self.find_texture_handle(tile, &mut state, ui.ctx());
-
-            if let Some((texture_handle, uv)) = texture_handle {
-                painter.image(texture_handle.id(), r, uv, Color32::WHITE);
+            if let Some(draw) = self.resolve_tile(
+                *tile,
+                rect_min,
+                rect_max,
+                device,
+                queue,
+                &mut loading_rects,
+            ) {
+                draws.push(draw);
             }
         }
 
-        // Issue warming fetches for adjacent-zoom tiles. Discards the
-        // returned handle/UV: these tiles are not painted this frame, but
-        // their textures land in state.registered_tile_textures and are
-        // kept alive by the retain set passed to unload_unused_textures.
+        // Warm preload tiles — fire the loader but don't paint anything.
         for tile in preload_parent.iter().chain(preload_child.iter()) {
-            let _ = self.find_texture_handle(tile, &mut state, ui.ctx());
+            self.warm_tile(*tile, device, queue);
         }
 
-        state.unload_unused_textures(
+        // Evict GPU textures outside the union of visible + preload sets.
+        self.tile_renderer.retain(
             tiles
                 .iter()
                 .chain(preload_parent.iter())
                 .chain(preload_child.iter()),
         );
 
-        for shape in &self.shapes {
+        // ── Project overlay shapes to viewport-local pixel space ─────
+        let project = |p: Point<f64>| -> glam::Vec2 {
+            let norm = normalized_mercator(p);
+            glam::Vec2::new(
+                scale(norm.x(), east, west, vx_min, vx_max) as f32,
+                scale(norm.y(), south, north, vy_min, vy_max) as f32,
+            )
+        };
+
+        // Borrow-checker: keep per-shape projected point Vecs alive while
+        // OverlayShape borrows them.
+        let mut polyline_points: Vec<Vec<glam::Vec2>> = Vec::new();
+        let mut polygon_points: Vec<Vec<glam::Vec2>> = Vec::new();
+        for shape in shapes {
             match shape {
-                Shape::Line(start, end, stroke) => {
-                    let line_start = normalized_mercator(*start);
-                    let line_end = normalized_mercator(*end);
-
-                    let line_start = Pos2::new(
-                        scale(line_start.x(), east, west, vx_min, vx_max) as f32,
-                        scale(line_start.y(), south, north, vy_min, vy_max) as f32,
-                    );
-                    let line_end = Pos2::new(
-                        scale(line_end.x(), east, west, vx_min, vx_max) as f32,
-                        scale(line_end.y(), south, north, vy_min, vy_max) as f32,
-                    );
-
-                    painter.line_segment([line_start, line_end], *stroke);
+                Shape::Line(_, _, _) => {}
+                Shape::LineString(pts, _) => {
+                    polyline_points.push(pts.iter().copied().map(project).collect());
                 }
-                Shape::LineString(points, stroke) => {
-                    let points = points
-                        .iter()
-                        .map(|p| {
-                            let p = normalized_mercator(*p);
-                            Pos2::new(
-                                scale(p.x(), east, west, vx_min, vx_max) as f32,
-                                scale(p.y(), south, north, vy_min, vy_max) as f32,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-
-                    painter.line(points, *stroke);
+                Shape::Circle(_, _, _, _) => {}
+                Shape::Polygon(pts, _, _) => {
+                    polygon_points.push(pts.iter().copied().map(project).collect());
                 }
-                Shape::Circle(point, radius, stroke, fill) => {
-                    let center = normalized_mercator(*point);
-                    let center = Pos2::new(
-                        scale(center.x(), east, west, vx_min, vx_max) as f32,
-                        scale(center.y(), south, north, vy_min, vy_max) as f32,
-                    );
+            }
+        }
+        // Single-segment Lines: stash a length-2 vec alongside.
+        let mut line_points: Vec<Vec<glam::Vec2>> = Vec::new();
+        for shape in shapes {
+            if let Shape::Line(a, b, _) = shape {
+                line_points.push(vec![project(*a), project(*b)]);
+            }
+        }
 
-                    let radius = *radius;
+        let mut overlay_shapes: Vec<OverlayShape<'_>> = Vec::new();
 
-                    if fill.is_some() && stroke.is_some() {
-                        let fill_color = fill.unwrap();
-                        let stroke = stroke.unwrap();
-                        painter.circle(center, radius, fill_color, stroke);
-                    } else if fill.is_some() {
-                        let fill_color = fill.unwrap();
-                        painter.circle_filled(center, radius, fill_color);
-                    } else if stroke.is_some() {
-                        let stroke = stroke.unwrap();
-                        painter.circle_stroke(center, radius, stroke);
+        // Loading indicators are drawn first so user shapes paint on top.
+        if self.show_loading_indicator && !loading_rects.is_empty() {
+            let t = self.start.elapsed().as_secs_f32();
+            // Sinusoidal pulse, 3 rad/s ≈ ~0.5 Hz visible cycle.
+            let pulse = 0.5 + 0.5 * (t * 3.0).sin();
+            for (min, max) in &loading_rects {
+                let center = (*min + *max) * 0.5;
+                let base = (max.x - min.x).min(max.y - min.y) * 0.08;
+                // Static white ring …
+                overlay_shapes.push(OverlayShape::CircleStroke {
+                    center,
+                    radius: base,
+                    stroke: Stroke::new(2.0, Color::rgba(255, 255, 255, 180)),
+                });
+                // … with pulsing translucent fill inside.
+                let inner = base * (0.35 + 0.5 * pulse);
+                let alpha = (60.0 + 160.0 * pulse) as u8;
+                overlay_shapes.push(OverlayShape::CircleFill {
+                    center,
+                    radius: inner,
+                    fill: Color::rgba(255, 255, 255, alpha),
+                });
+            }
+        }
+
+        let mut ls_i = 0;
+        let mut pg_i = 0;
+        let mut ln_i = 0;
+        for shape in shapes {
+            match shape {
+                Shape::Line(_, _, stroke) => {
+                    overlay_shapes.push(OverlayShape::Polyline {
+                        points: &line_points[ln_i],
+                        stroke: *stroke,
+                        closed: false,
+                    });
+                    ln_i += 1;
+                }
+                Shape::LineString(_, stroke) => {
+                    overlay_shapes.push(OverlayShape::Polyline {
+                        points: &polyline_points[ls_i],
+                        stroke: *stroke,
+                        closed: false,
+                    });
+                    ls_i += 1;
+                }
+                Shape::Circle(center, radius, stroke, fill) => {
+                    let c = project(*center);
+                    if let Some(fill) = fill {
+                        overlay_shapes.push(OverlayShape::CircleFill {
+                            center: c,
+                            radius: *radius,
+                            fill: *fill,
+                        });
+                    }
+                    if let Some(stroke) = stroke {
+                        overlay_shapes.push(OverlayShape::CircleStroke {
+                            center: c,
+                            radius: *radius,
+                            stroke: *stroke,
+                        });
                     }
                 }
-                Shape::Polygon(points, stroke, fill) => {
-                    let pts = points
-                        .iter()
-                        .map(|p| {
-                            let p = normalized_mercator(*p);
-                            Pos2::new(
-                                scale(p.x(), east, west, vx_min, vx_max) as f32,
-                                scale(p.y(), south, north, vy_min, vy_max) as f32,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-
-                    // egui::Shape::convex_polygon handles both fill (when
-                    // convex) and stroke in a single draw call; missing
-                    // fill/stroke degrade to TRANSPARENT / Stroke::NONE.
-                    let fill_color = fill.unwrap_or(Color32::TRANSPARENT);
-                    let path_stroke = stroke.unwrap_or(Stroke::NONE);
-                    painter.add(egui::Shape::convex_polygon(
-                        pts,
-                        fill_color,
-                        path_stroke,
-                    ));
+                Shape::Polygon(_, stroke, fill) => {
+                    if let Some(fill) = fill {
+                        overlay_shapes.push(OverlayShape::PolygonFill {
+                            points: &polygon_points[pg_i],
+                            fill: *fill,
+                        });
+                    }
+                    if let Some(stroke) = stroke {
+                        overlay_shapes.push(OverlayShape::Polyline {
+                            points: &polygon_points[pg_i],
+                            stroke: *stroke,
+                            closed: true,
+                        });
+                    }
+                    pg_i += 1;
                 }
             }
         }
 
-        let drag = response.drag_delta();
-        if drag != Vec2::ZERO {
-            // input range x 0.0 .. w
-            // output range x 0.0 .. (west - east)
-            let x = scale(drag.x as f64, 0.0, w, 0.0, west - east);
-            // range y 0.0 .. h
-            // output range y 0.0 .. (north - south)
-            let y = scale(drag.y as f64, 0.0, h, 0.0, north - south);
+        // ── Issue draws ───────────────────────────────────────────────
+        self.tile_renderer
+            .render(device, queue, viewport.size, &draws, pass);
+        self.overlay_renderer
+            .render(device, queue, viewport.size, &overlay_shapes, pass);
 
-            state.x -= x;
-            state.x = state.x.clamp(0.0, 1.0);
-
-            state.y -= y;
-            state.y = state.y.clamp(0.0, 1.0);
+        // Keep redrawing while tiles are loading so the indicator animates.
+        if self.show_loading_indicator && !loading_rects.is_empty() {
+            (self.repaint)();
         }
 
-        // Compute the post-drag viewport so the returned response reflects
-        // what will be drawn on the next frame. n_rect (normalized Mercator)
-        // is recomputed because the drag above may have moved state.{x,y}.
-        let n_rect_after = norm_rect(state.x, state.y, state.zoom, desired_tiles);
+        // ── Apply drag delta after rendering (matches original ordering)
+        if input.drag_delta != glam::Vec2::ZERO {
+            let dx = scale(input.drag_delta.x as f64, 0.0, w, 0.0, west - east);
+            let dy = scale(input.drag_delta.y as f64, 0.0, h, 0.0, north - south);
+            self.state.x -= dx;
+            self.state.x = self.state.x.clamp(0.0, 1.0);
+            self.state.y -= dy;
+            self.state.y = self.state.y.clamp(0.0, 1.0);
+            self.positioned = true;
+        }
 
-        let visible_top_left_norm = scale_rect(
-            Point::new(rect.min.x as f64, rect.min.y as f64),
-            view_rect,
+        // ── Build response with post-drag bounds ─────────────────────
+        let n_rect_after =
+            norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
+
+        let visible_tl_norm = scale_rect(
+            Point::new(0.0, 0.0),
+            view,
             n_rect_after,
         );
-        let visible_bottom_right_norm = scale_rect(
-            Point::new(rect.max.x as f64, rect.max.y as f64),
-            view_rect,
+        let visible_br_norm = scale_rect(
+            Point::new(w, h),
+            view,
             n_rect_after,
         );
         let visible_bounds = geo::Rect::new(
-            reverse_normalized_mercator(visible_top_left_norm),
-            reverse_normalized_mercator(visible_bottom_right_norm),
+            reverse_normalized_mercator(visible_tl_norm),
+            reverse_normalized_mercator(visible_br_norm),
         );
-
         let projected_bounds = geo::Rect::new(
             reverse_normalized_mercator(Point::from(n_rect_after.min())),
             reverse_normalized_mercator(Point::from(n_rect_after.max())),
         );
 
-        let center = reverse_normalized_mercator(Point::new(state.x, state.y));
-        let zoom = state.zoom;
-
-        state.store(ui.ctx(), self.id);
-
         EMapResponse {
-            response,
-            pointer_position: self.pointer_position,
+            pointer_position,
             visible_bounds,
             projected_bounds,
-            center,
-            zoom,
+            center: reverse_normalized_mercator(Point::new(self.state.x, self.state.y)),
+            zoom: self.state.zoom,
         }
     }
 
-    /// Resolve the texture (and UV sub-rect) to draw for a given tile.
-    ///
-    /// Lookup order:
-    /// 1. Already-uploaded texture for this exact tile (UV = full image).
-    /// 2. Trigger the [`TileLoader`] to fetch the tile; if the loader returns
-    ///    data synchronously it's uploaded immediately, otherwise a later
-    ///    frame will pick it up.
-    /// 3. Pyramid fallback: walk up parent tiles (`z-1`, `z-2`, …) and reuse
-    ///    a cached coarser texture, returning the matching quadrant as the
-    ///    UV rect. This keeps the map covered with a blurry-but-correct
-    ///    image while the higher-zoom tile is still loading.
-    fn find_texture_handle(
-        &self,
-        tile: &TileId,
-        state: &mut EMapState,
-        ctx: &Context,
-    ) -> Option<(TextureHandle, Rect)> {
-        let texture_handle = state.registered_tile_textures.get(tile).cloned();
-        if let Some(h) = texture_handle {
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-            return Some((h, uv));
+    /// Resolve a draw for `tile`, uploading newly-arrived tile images and
+    /// falling back to a cached pyramid parent if the exact tile isn't
+    /// resident yet. Pushes the tile's screen rect onto `loading_rects` when
+    /// the loader reports the tile is still in flight.
+    fn resolve_tile(
+        &mut self,
+        tile: TileId,
+        rect_min: glam::Vec2,
+        rect_max: glam::Vec2,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        loading_rects: &mut Vec<(glam::Vec2, glam::Vec2)>,
+    ) -> Option<TileDraw> {
+        if self.tile_renderer.contains(&tile) {
+            return Some(TileDraw::full_uv(tile, rect_min, rect_max));
         }
 
-        let url = self.tile_url_provider.url(*tile).to_string();
-
-        let loader: &dyn TileLoader = self
-            .tile_loader
-            .unwrap_or_else(|| DEFAULT_TILE_LOADER.deref());
-
-        let img_data = loader.tile(url, tile, ctx.clone());
-        if let Some(img_data) = img_data {
-            let h = ctx.load_texture(
-                format!("{:?}", tile),
-                img_data,
-                egui::TextureOptions::LINEAR,
-            );
-            state.registered_tile_textures.insert(*tile, h.clone());
-            let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-            return Some((h, uv));
+        let url = self.tile_url_provider.url(tile);
+        match self.tile_loader.tile(url, &tile, self.repaint.clone()) {
+            TileFetch::Ready(img) => {
+                self.tile_renderer.upload(device, queue, tile, &img);
+                return Some(TileDraw::full_uv(tile, rect_min, rect_max));
+            }
+            TileFetch::Loading => {
+                loading_rects.push((rect_min, rect_max));
+            }
         }
 
-        let (mut new_tile, mut new_uv) =
-            tile.zoom_out_with_uv(Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        // Pyramid fallback: walk up parents looking for a cached coarser
+        // texture, sampling the matching sub-rect.
+        let (mut parent, mut uv) = tile.zoom_out_with_uv(UvRect::FULL);
         loop {
-            if new_tile.z == 0 {
-                break;
+            if self.tile_renderer.contains(&parent) {
+                return Some(TileDraw::with_uv(parent, rect_min, rect_max, uv));
             }
-
-            let texture_handle = state.registered_tile_textures.get(&new_tile).cloned();
-            if let Some(h) = texture_handle {
-                return Some((h, new_uv));
+            if parent.z == 0 {
+                return None;
             }
-            (new_tile, new_uv) = new_tile.zoom_out_with_uv(new_uv);
+            (parent, uv) = parent.zoom_out_with_uv(uv);
         }
-
-        None
-    }
-}
-
-impl Widget for EMap<'_> {
-    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        self.show(ui).response
-    }
-}
-
-/// Convert an egui [`Pos2`] (f32 screen pixels) into a `geo::Point<f64>` so
-/// it can participate in the projection math without precision loss.
-fn geo_from_pos2(p: Pos2) -> Point<f64> {
-    Point::new(p.x as f64, p.y as f64)
-}
-
-/// Compute the screen-space square that the map renders into.
-///
-/// The square is centered in the viewport and uses the longer side of the
-/// allocated rectangle, so the projection stays isotropic (no horizontal or
-/// vertical stretching) regardless of the host UI's aspect ratio.
-fn view_rect(w: f64, h: f64) -> geo::Rect<f64> {
-    let major = w.max(h);
-    let vx_min = (w / 2.0) - (major / 2.0);
-    let vx_max = (w / 2.0) + (major / 2.0);
-    let vy_min = (h / 2.0) - (major / 2.0);
-    let vy_max = (h / 2.0) + (major / 2.0);
-    geo::Rect::new(Point::new(vx_min, vy_min), Point::new(vx_max, vy_max))
-}
-
-/// Compute the visible rectangle in normalized-Mercator coordinates.
-///
-/// Given a map center (`x`, `y`), a (possibly fractional) `zoom`, and how
-/// many tile-widths the viewport spans (`desired_tiles`), this returns the
-/// north/south/east/west bounds in the `[0, 1]` normalized Mercator frame
-/// that the renderer projects into screen space.
-fn norm_rect(x: f64, y: f64, zoom: f64, desired_tiles: f64) -> geo::Rect<f64> {
-    let nf = 2.0f64.powf(zoom);
-    let t_side = 1.0 / nf;
-    let east = x - (0.5 * desired_tiles * t_side);
-    let west = x + (0.5 * desired_tiles * t_side);
-    let north = y + (0.5 * desired_tiles * t_side);
-    let south = y - (0.5 * desired_tiles * t_side);
-
-    geo::Rect::new(Point::new(east, north), Point::new(west, south))
-}
-
-/// Linearly remap `v` from `[src_min, src_max]` into `[tgt_min, tgt_max]`.
-///
-/// No clamping; values outside the source range extrapolate.
-fn scale(v: f64, src_min: f64, src_max: f64, tgt_min: f64, tgt_max: f64) -> f64 {
-    let src_range = src_max - src_min;
-    let tgt_range = tgt_max - tgt_min;
-
-    let v = (v - src_min) / src_range;
-    v * tgt_range + tgt_min
-}
-
-/// 2D version of [`scale`]: remap a point from one rectangle into another.
-fn scale_rect(pos: Point<f64>, src_space: geo::Rect<f64>, tgt_space: geo::Rect<f64>) -> Point<f64> {
-    let x = scale(
-        pos.x(),
-        src_space.min().x,
-        src_space.max().x,
-        tgt_space.min().x,
-        tgt_space.max().x,
-    );
-    let y = scale(
-        pos.y(),
-        src_space.min().y,
-        src_space.max().y,
-        tgt_space.min().y,
-        tgt_space.max().y,
-    );
-    Point::new(x, y)
-}
-
-/// Project a geographic point (lon/lat in degrees) into normalized Web
-/// Mercator space, where `(0, 0)` is the top-left of the world tile and
-/// `(1, 1)` is the bottom-right.
-///
-/// The standard Web Mercator y formula `asinh(tan(lat))` is used and then
-/// rescaled to the `[0, 1]` range. Latitudes outside ±85.0511° map outside
-/// `[0, 1]` (Web Mercator is undefined at the poles).
-fn normalized_mercator(p: Point<f64>) -> Point<f64> {
-    let lon = p.x();
-    let lat = p.y();
-
-    let x_wm = lon;
-    let y_wm = lat.to_radians().tan().asinh();
-
-    let x = 0.5 + (x_wm / 360.0);
-    let y = 0.5 - (y_wm / (2.0 * std::f64::consts::PI));
-
-    Point::new(x, y)
-}
-
-/// Inverse of [`normalized_mercator`]: unproject a normalized Mercator
-/// `(x, y) ∈ [0, 1]²` back to geographic (lon, lat) degrees.
-fn reverse_normalized_mercator(p: Point<f64>) -> Point<f64> {
-    let x = p.x();
-    let y = p.y();
-
-    let x_wm = (x - 0.5) * 360.0;
-    let y_wm = (0.5 - y) * 2.0 * std::f64::consts::PI;
-
-    let lon = x_wm;
-    let lat = y_wm.sinh().atan().to_degrees();
-
-    Point::new(lon, lat)
-}
-
-/// Convert a geographic point to fractional tile coordinates at `zoom`.
-///
-/// The integer part is the XYZ tile id; the fractional part is the position
-/// within that tile.
-fn tile_coords(p: Point<f64>, zoom: u8) -> Point<f64> {
-    let projected = normalized_mercator(p);
-
-    let n = 2.0f64.powi(zoom as i32);
-
-    let x_tile = projected.x() * n;
-    let y_tile = projected.y() * n;
-
-    Point::new(x_tile, y_tile)
-}
-
-/// Identifier for a single tile in the XYZ slippy-map scheme.
-///
-/// At zoom `z` the world is divided into a `2^z × 2^z` grid of tiles, where
-/// `x` increases east from longitude 180°W and `y` increases south from the
-/// Mercator-clamped north edge. This is the same convention as OpenStreetMap,
-/// Mapbox, Google Maps, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TileId {
-    /// Column index, `0..2^z`, increasing east.
-    pub x: i32,
-    /// Row index, `0..2^z`, increasing south.
-    pub y: i32,
-    /// Zoom level. `0` is one tile covering the whole world.
-    pub z: u8,
-}
-
-impl TileId {
-    /// Tile that contains the given geographic point at the requested zoom.
-    fn from_point_and_zoom(p: Point<f64>, zoom: u8) -> Self {
-        let coords = tile_coords(p, zoom);
-        let x = coords.x() as i32;
-        let y = coords.y() as i32;
-
-        Self { x, y, z: zoom }
     }
 
-    /// Enumerate every tile that intersects the geographic rectangle spanned
-    /// by `p1` and `p2` at `zoom`, expanded outward by `padding` tiles on
-    /// each side.
-    ///
-    /// Tiles outside the valid `0..2^z` range are skipped, so the result is
-    /// safe to feed straight to a tile URL provider without bounds checks.
-    fn from_bounds(p1: Point<f64>, p2: Point<f64>, zoom: u8, padding: i32) -> Vec<Self> {
-        let left_x = p1.x().min(p2.x());
-        let right_x = p1.x().max(p2.x());
-
-        let top_y = p1.y().max(p2.y());
-        let bottom_y = p1.y().min(p2.y());
-
-        let top_left = Point::new(left_x, top_y);
-        let bottom_right = Point::new(right_x, bottom_y);
-
-        let top_left_tile = Self::from_point_and_zoom(top_left, zoom);
-        let bottom_right_tile = Self::from_point_and_zoom(bottom_right, zoom);
-
-        let mut tiles = Vec::new();
-
-        let n = 2u32.pow(zoom as u32);
-
-        for x in (top_left_tile.x - padding)..=(bottom_right_tile.x + padding) {
-            for y in (top_left_tile.y - padding)..=(bottom_right_tile.y + padding) {
-                if x < 0 || y < 0 || x >= n as i32 || y >= n as i32 {
-                    continue;
-                }
-                tiles.push(Self { x, y, z: zoom });
-            }
+    /// Issue a fetch for a preload tile without taking a screen rect. The
+    /// returned image (if any) is uploaded so the next frame's
+    /// [`resolve_tile`](Self::resolve_tile) call finds it in the cache.
+    fn warm_tile(&mut self, tile: TileId, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.tile_renderer.contains(&tile) {
+            return;
         }
-
-        tiles
-    }
-
-    /// North-west corner of this tile in normalized Mercator space.
-    fn top_left_normalized(&self) -> Point<f64> {
-        let x = self.x as f64;
-        let y = self.y as f64;
-
-        let n = 2.0f64.powi(self.z as i32);
-
-        let x_tile = x / n;
-        let y_tile = y / n;
-
-        Point::new(x_tile, y_tile)
-    }
-
-    /// South-east corner of this tile in normalized Mercator space.
-    fn bottom_right_normalized(&self) -> Point<f64> {
-        let x = (self.x + 1) as f64;
-        let y = (self.y + 1) as f64;
-
-        let n = 2.0f64.powi(self.z as i32);
-
-        let x_tile = x / n;
-        let y_tile = y / n;
-
-        Point::new(x_tile, y_tile)
-    }
-
-    /// Step one level up the tile pyramid, returning the parent tile and the
-    /// UV sub-rect within that parent corresponding to *this* tile's area.
-    ///
-    /// Used by the pyramid fallback in [`EMap::find_texture_handle`]: when a
-    /// high-zoom tile isn't loaded yet, repeated calls to this walk up the
-    /// pyramid until a cached parent is found, and the accumulated UV rect
-    /// selects the quadrant that should be drawn in place of the missing
-    /// tile.
-    fn zoom_out_with_uv(&self, uv: Rect) -> (TileId, Rect) {
-        let new_tile = TileId {
-            x: self.x / 2,
-            y: self.y / 2,
-            z: self.z - 1,
-        };
-
-        let uv_left = if self.y % 2 == 0 { 0.0 } else { 0.5 };
-        let uv_right = uv_left + 0.5;
-
-        let uv_top = if self.x % 2 == 0 { 0.0 } else { 0.5 };
-        let uv_bottom = uv_top + 0.5;
-
-        let uv_left = uv.min.y + (uv.height()) * uv_left;
-        let uv_right = uv.min.y + (uv.height()) * uv_right;
-
-        let uv_top = uv.min.x + (uv.width()) * uv_top;
-        let uv_bottom = uv.min.x + (uv.width()) * uv_bottom;
-
-        let uv = Rect::from_min_max(Pos2::new(uv_top, uv_left), Pos2::new(uv_bottom, uv_right));
-
-        (new_tile, uv)
+        let url = self.tile_url_provider.url(tile);
+        if let TileFetch::Ready(img) = self.tile_loader.tile(url, &tile, self.repaint.clone()) {
+            self.tile_renderer.upload(device, queue, tile, &img);
+        }
     }
 }

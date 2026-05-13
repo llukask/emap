@@ -1,129 +1,158 @@
-//! Minimal eframe app demonstrating the `emap` widget: a map of Vienna with
-//! a fixed gold line and a user-editable red polyline (left-click to add a
-//! point, right-click to pop the last one).
+//! eframe demo for the `emap` crate.
+//!
+//! Uses the `emap::egui_wgpu` integration to embed the map inside an
+//! egui frame. Left-click adds a polygon vertex, right-click pops, the
+//! scroll-wheel zooms toward the cursor, and dragging with the left
+//! button pans. A floating "viewport" window reads the latest
+//! `EMapResponse` and prints the center / zoom / cursor / bounds.
+//!
+//! Run with `cargo run --example eframe --features egui-wgpu`.
 
-use egui::{Color32, Stroke};
-use emap::CachingTileLoader;
-use geo::Point;
+use std::sync::Arc;
 
-fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions {
-        viewport: egui::viewport::ViewportBuilder::default().with_title("emap example"),
+use eframe::egui;
+use emap::egui_wgpu::EmapHandle;
+use emap::{CachingTileLoader, Color, EMapResponse, Shape, Stroke};
+
+fn main() -> Result<(), eframe::Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,emap=info")),
+        )
+        .init();
+
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
-
-    // Persist tiles under ./cache so repeat launches don't re-download from OSM.
-    let tile_loader = CachingTileLoader::new("./cache");
     eframe::run_native(
-        "eframe template",
-        native_options,
-        Box::new(|_cc| {
-            Ok(Box::new(EMapApp {
-                tile_loader,
-                points: vec![],
-            }))
-        }),
-    )?;
-
-    Ok(())
+        "emap — eframe demo",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
 }
 
-struct EMapApp {
-    // Owned by the app so it outlives every per-frame `EMap` builder; the
-    // widget only borrows it.
-    tile_loader: CachingTileLoader,
-
-    /// Polyline points collected from user clicks, in lon/lat.
-    points: Vec<Point<f64>>,
+struct App {
+    emap: EmapHandle,
+    polygon_points: Vec<geo::Point<f64>>,
 }
 
-impl eframe::App for EMapApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let line_start = Point::new(16.340083, 48.179349);
-            let line_end = Point::new(16.341451, 48.176684);
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let rs = cc
+            .wgpu_render_state
+            .as_ref()
+            .expect("eframe Wgpu renderer required");
 
-            // `initial_position` only applies on the first frame, so panning
-            // and zooming the map afterwards is preserved across updates.
-            let mut map = emap::EMap::new("map")
-                .initial_position(ctx, 48.178993463351695, 16.340540441879874, 12)
-                .tile_size(256.0)
-                .tile_loader(&self.tile_loader);
-            map = map.line(
-                line_start,
-                line_end,
-                Stroke::new(4.0, Color32::GOLD.gamma_multiply(0.75)),
-            );
-
-            // Small filled triangle near the gold line so the polygon
-            // primitive has a visible demonstration on screen.
-            let triangle = vec![
-                Point::new(16.339_000, 48.180_000),
-                Point::new(16.342_500, 48.179_500),
-                Point::new(16.340_500, 48.177_500),
-            ];
-            map = map.polygon(
-                triangle,
-                Some(Stroke::new(2.0, Color32::WHITE)),
-                Some(Color32::BLUE.gamma_multiply(0.35)),
-            );
-
-            for p in &self.points {
-                map = map.filled_circle(*p, 10.0, Color32::RED);
-            }
-
-            map = map.line_string(self.points.clone(), Stroke::new(2.0, Color32::GREEN));
-
-            let r = map.show(ui);
-            // Left-click appends the cursor's geographic position; right-click pops.
-            if r.clicked() {
-                if let Some(pos) = r.pointer_position() {
-                    self.points.push(pos);
-                }
-            } else if r.secondary_clicked() {
-                self.points.pop();
-            }
-
-            // Demonstrate the data exposed via EMapResponse. The window
-            // floats over the map and updates every frame, so it doubles as
-            // a sanity check that the bounds track pan + wheel zoom.
-            let center = r.center();
-            let visible = r.visible_bounds();
-            let projected = r.projected_bounds();
-            egui::Window::new("viewport")
-                .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(format!("zoom:   {:.2}", r.zoom()));
-                    ui.label(format!(
-                        "center: {:.5}, {:.5}",
-                        center.y(),
-                        center.x(),
-                    ));
-                    ui.label(format!(
-                        "visible lon: {:.5} … {:.5}",
-                        visible.min().x,
-                        visible.max().x,
-                    ));
-                    ui.label(format!(
-                        "visible lat: {:.5} … {:.5}",
-                        visible.min().y,
-                        visible.max().y,
-                    ));
-                    ui.label(format!(
-                        "projected lon: {:.5} … {:.5}",
-                        projected.min().x,
-                        projected.max().x,
-                    ));
-                    ui.label(format!(
-                        "projected lat: {:.5} … {:.5}",
-                        projected.min().y,
-                        projected.max().y,
-                    ));
-                    if let Some(p) = r.pointer_position() {
-                        ui.label(format!("pointer: {:.5}, {:.5}", p.y(), p.x()));
-                    }
-                });
+        let emap = EmapHandle::install(rs, &cc.egui_ctx);
+        emap.with(|e| {
+            e.set_tile_loader(Arc::new(CachingTileLoader::new("cache")));
+            e.set_initial_position(52.5, 13.4, 8);
         });
+
+        Self {
+            emap,
+            polygon_points: Vec::new(),
+        }
     }
+
+    fn shapes(&self) -> Vec<Shape> {
+        if self.polygon_points.len() >= 3 {
+            vec![Shape::polygon(
+                self.polygon_points.clone(),
+                Some(Stroke::new(2.0, Color::WHITE)),
+                Some(Color::rgba(220, 40, 40, 96)),
+            )]
+        } else if self.polygon_points.len() == 2 {
+            vec![Shape::line(
+                self.polygon_points[0],
+                self.polygon_points[1],
+                Stroke::new(2.0, Color::WHITE),
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _eframe_frame: &mut eframe::Frame) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                let (rect, response) = self.emap.show(ui, self.shapes());
+
+                if response.clicked()
+                    && let Some(pos) = response.interact_pointer_pos()
+                {
+                    let geo = self.emap.screen_to_geo(
+                        pos - rect.min,
+                        rect.size(),
+                        ctx.pixels_per_point(),
+                    );
+                    self.polygon_points.push(geo);
+                }
+                if response.secondary_clicked() {
+                    self.polygon_points.pop();
+                }
+            });
+
+        if let Some(r) = self.emap.last_response() {
+            viewport_window(ctx, &r, self.polygon_points.len());
+        }
+    }
+}
+
+fn viewport_window(ctx: &egui::Context, r: &EMapResponse, polygon_points: usize) {
+    egui::Window::new("viewport")
+        .resizable(false)
+        .default_pos(egui::pos2(12.0, 12.0))
+        .show(ctx, |ui| {
+            egui::Grid::new("emap_response_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("center");
+                    ui.monospace(format!("{:.5}, {:.5}", r.center().y(), r.center().x()));
+                    ui.end_row();
+
+                    ui.label("zoom");
+                    ui.monospace(format!("{:.3}", r.zoom()));
+                    ui.end_row();
+
+                    ui.label("cursor");
+                    match r.pointer_position() {
+                        Some(p) => ui.monospace(format!("{:.5}, {:.5}", p.y(), p.x())),
+                        None => ui.monospace("—"),
+                    };
+                    ui.end_row();
+
+                    let v = r.visible_bounds();
+                    ui.label("visible");
+                    ui.monospace(format!(
+                        "{:.4}…{:.4}, {:.4}…{:.4}",
+                        v.min().y,
+                        v.max().y,
+                        v.min().x,
+                        v.max().x,
+                    ));
+                    ui.end_row();
+
+                    let p = r.projected_bounds();
+                    ui.label("projected");
+                    ui.monospace(format!(
+                        "{:.4}…{:.4}, {:.4}…{:.4}",
+                        p.min().y,
+                        p.max().y,
+                        p.min().x,
+                        p.max().x,
+                    ));
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label(format!("polygon points: {polygon_points}"));
+            ui.label("left-click: add point · right-click: pop");
+        });
 }

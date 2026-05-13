@@ -1,21 +1,30 @@
 [package]
 name = "emap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [features]
 default = ["tokio", "caching"]
 tokio = ["dep:tokio", "dep:reqwest"]
 caching = ["tokio", "tokio/fs", "dep:bytes"]
+# Egui paint-callback integration. Pulls in `egui` and `egui-wgpu` and
+# exposes the `emap::egui_wgpu` module with the EmapHandle helper.
+egui-wgpu = ["dep:egui", "dep:egui-wgpu"]
 
 [dependencies]
-egui = { version = "0.31.0", default-features = false }
+wgpu = "24"
+bytemuck = { version = "1.18", features = ["derive"] }
+glam = { version = "0.29", features = ["bytemuck"] }
+lyon = "1.0"
 geo = { version = "0.28.0", default-features = false }
 image = { version = "0.25.5", default-features = false, features = [
     "jpeg",
     "png",
 ] }
 bytes = { version = "1.10.0", optional = true }
+tracing = "0.1"
+egui = { version = "0.31", optional = true }
+egui-wgpu = { version = "0.31", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { version = "0.12.12", default-features = false, optional = true, features = [
@@ -29,12 +38,21 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 ] }
 
 [dev-dependencies]
-eframe = { version = "0.31.0", default-features = false, features = [
+winit = "0.30"
+pollster = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eframe = { version = "0.31", default-features = false, features = [
     "default_fonts",
     "wgpu",
     "wayland",
+    "x11",
 ] }
+
+[[example]]
+name = "winit"
+path = "examples/winit.rs"
 
 [[example]]
 name = "eframe"
 path = "examples/eframe.rs"
+required-features = ["egui-wgpu"]

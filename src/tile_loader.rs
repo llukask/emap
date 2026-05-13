@@ -16,50 +16,97 @@
 
 use std::sync::{Arc, LazyLock};
 
-use egui::{ColorImage, Context};
-
 use crate::TileId;
+
+/// Decoded RGBA8 tile image ready for upload to a GPU texture.
+///
+/// Pixel data is tightly packed `[r, g, b, a, …]` with `pixels.len() ==
+/// width * height * 4`. Width and height are usually equal (256 or 512) but
+/// tile providers may serve other sizes, so the renderer reads them from
+/// the image.
+#[derive(Debug, Clone)]
+pub struct TileImage {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Callback used by an asynchronous [`TileLoader`] to wake the renderer once
+/// a tile finishes loading.
+///
+/// The renderer itself doesn't run an event loop, so loaders need an
+/// out-of-band way to nudge the host (e.g. `window.request_redraw()` on
+/// winit). Concrete loaders capture this `Arc` and invoke it from their
+/// background workers.
+pub type RepaintSignal = Arc<dyn Fn() + Send + Sync>;
 
 /// Process-wide fallback loader used when the widget has no explicit one.
 ///
 /// Resolves to [`TokioTileLoader`] when the `tokio` feature is on (the
 /// default) and to [`DummyLoader`] otherwise. Lazily constructed on first
 /// access so the background thread isn't spawned unless tiles are actually
-/// requested.
+/// requested. Stored as an [`Arc<dyn TileLoader>`] so it can be handed to
+/// [`crate::EMap`] without copying or further wrapping.
 #[cfg(feature = "tokio")]
-pub static DEFAULT_TILE_LOADER: LazyLock<TokioTileLoader> = LazyLock::new(TokioTileLoader::new);
+pub static DEFAULT_TILE_LOADER: LazyLock<Arc<dyn TileLoader>> =
+    LazyLock::new(|| Arc::new(TokioTileLoader::new()));
 
 /// Process-wide fallback loader (`tokio` feature disabled): always returns
 /// the [`DummyLoader`] placeholder image.
 #[cfg(not(feature = "tokio"))]
-pub static DEFAULT_TILE_LOADER: LazyLock<DummyLoader> = LazyLock::new(|| DummyLoader);
+pub static DEFAULT_TILE_LOADER: LazyLock<Arc<dyn TileLoader>> =
+    LazyLock::new(|| Arc::new(DummyLoader));
+
+/// Result of a [`TileLoader::tile`] call.
+///
+/// Distinguishes "image is in flight, please show a loading indicator" from
+/// "image is ready to upload" so the renderer can react accordingly.
+pub enum TileFetch {
+    /// The tile is being fetched (request queued, network in progress, or
+    /// decode running). No bytes available this frame.
+    Loading,
+    /// The tile is decoded and ready to be uploaded as a GPU texture.
+    Ready(Arc<TileImage>),
+}
 
 /// Strategy for obtaining decoded pixel data for a tile.
 ///
 /// Implementations are expected to be non-blocking from the caller's point of
-/// view: return `None` if the tile isn't ready yet and let a later frame
-/// retry. Implementations that fetch asynchronously should call
-/// `ctx.request_repaint()` once the tile becomes available so the UI picks
-/// it up promptly.
-pub trait TileLoader {
+/// view: return [`TileFetch::Loading`] if the tile isn't ready yet and let a
+/// later frame retry. Implementations that fetch asynchronously should invoke
+/// the supplied [`RepaintSignal`] once the tile becomes available so the
+/// host requests a redraw.
+pub trait TileLoader: Send + Sync {
     /// Look up or initiate a fetch for `tile_id`.
     ///
     /// `url` is pre-computed by the [`crate::TileUrlProvider`] so the loader
-    /// doesn't need to know about URL templating. `ctx` is captured by async
-    /// implementations to request a repaint when the tile finishes loading.
-    fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>>;
+    /// doesn't need to know about URL templating. `repaint` is held by
+    /// async implementations and called when the tile finishes loading.
+    fn tile(&self, url: String, tile_id: &TileId, repaint: RepaintSignal) -> TileFetch;
 }
 
-/// Stub loader that always returns [`ColorImage::example`].
+/// Stub loader that always returns a fixed 64×64 checkerboard image.
 ///
 /// Useful for offline testing and for documenting the [`TileLoader`] trait
 /// without pulling in HTTP. Not useful in production maps.
 pub struct DummyLoader;
 
 impl TileLoader for DummyLoader {
-    fn tile(&self, _url: String, _tile_id: &TileId, _ctx: Context) -> Option<Arc<ColorImage>> {
-        let img = ColorImage::example();
-        Some(Arc::new(img))
+    fn tile(&self, _url: String, _tile_id: &TileId, _repaint: RepaintSignal) -> TileFetch {
+        const SIZE: u32 = 64;
+        let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let on = ((x / 8) + (y / 8)) % 2 == 0;
+                let v = if on { 200 } else { 60 };
+                pixels.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        TileFetch::Ready(Arc::new(TileImage {
+            width: SIZE,
+            height: SIZE,
+            pixels,
+        }))
     }
 }
 
@@ -84,7 +131,58 @@ mod tokio_loader {
         /// A fetch has been kicked off but no image data is available yet.
         Pending,
         /// The tile has been decoded and is ready to be uploaded as a texture.
-        Done(Arc<ColorImage>),
+        Done(Arc<TileImage>),
+    }
+
+    type Job = (TileId, String, RepaintSignal);
+
+    /// Decode the response body and store the resulting image, then wake the
+    /// host so the next frame uploads it as a texture. On decode failure the
+    /// in-flight entry is removed so the next frame re-queues the tile.
+    fn decode_and_store(
+        bytes: Vec<u8>,
+        tile_id: TileId,
+        tiles: Arc<Mutex<HashMap<TileId, Fetch>>>,
+        repaint: RepaintSignal,
+    ) {
+        // PNG/JPEG decode is CPU-bound and can stall an async worker; do it
+        // on the blocking pool so the tokio reactor stays responsive.
+        tokio::task::spawn_blocking(move || {
+            let image = match image::load_from_memory(&bytes) {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(
+                        "tile {:?} decode failed ({} bytes): {}",
+                        tile_id,
+                        bytes.len(),
+                        e
+                    );
+                    fail(tile_id, &tiles, &repaint);
+                    return;
+                }
+            };
+            let rgba = image.to_rgba8();
+            let (width, height) = (rgba.width(), rgba.height());
+            let pixels = rgba.into_raw();
+            let img = Arc::new(TileImage {
+                width,
+                height,
+                pixels,
+            });
+            tiles.lock().unwrap().insert(tile_id, Fetch::Done(img));
+            repaint();
+        });
+    }
+
+    /// Drop the pending entry for `tile_id` so a future frame re-requests
+    /// the tile, and wake the host to give it a chance to do so.
+    fn fail(
+        tile_id: TileId,
+        tiles: &Mutex<HashMap<TileId, Fetch>>,
+        repaint: &RepaintSignal,
+    ) {
+        tiles.lock().unwrap().remove(&tile_id);
+        repaint();
     }
 
     /// HTTP-fetching [`TileLoader`] backed by a dedicated tokio runtime.
@@ -93,17 +191,14 @@ mod tokio_loader {
     /// jobs are dispatched onto that runtime via an MPSC channel. Decoded
     /// images are stored in an in-memory table keyed by [`TileId`] and
     /// consumed (cloned) by the next call to [`TileLoader::tile`].
-    #[cfg(feature = "tokio")]
     pub struct TokioTileLoader {
         /// Channel into the background runtime; carries the tile id, fetch
-        /// URL, and an [`egui::Context`] used to request a repaint on
-        /// completion.
-        tx: Sender<(TileId, String, Context)>,
+        /// URL, and a repaint callback invoked on completion.
+        tx: Sender<Job>,
         /// In-flight + completed tiles. Shared with the background tasks.
         tiles: Arc<Mutex<HashMap<TileId, Fetch>>>,
     }
 
-    #[cfg(feature = "tokio")]
     impl TokioTileLoader {
         /// Spawn the background runtime and return a ready-to-use loader.
         ///
@@ -111,7 +206,7 @@ mod tokio_loader {
         /// by this instance; per-tile work runs as independent tokio tasks
         /// so requests proceed in parallel up to reqwest's connection limits.
         pub fn new() -> Self {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(1024);
             let tiles = Arc::new(Mutex::new(HashMap::new()));
             let t1 = tiles.clone();
             std::thread::spawn(move || {
@@ -121,8 +216,9 @@ mod tokio_loader {
                 rt.block_on(async move {
                     let client = Arc::new(ClientBuilder::default().build().unwrap());
                     loop {
-                        let (tile_id, url, ctx): (TileId, String, Context) =
-                            rx.recv().await.unwrap();
+                        let Some((tile_id, url, repaint)) = rx.recv().await else {
+                            break;
+                        };
                         let ts = tiles.clone();
                         {
                             ts.lock().unwrap().insert(tile_id, Fetch::Pending);
@@ -138,33 +234,44 @@ mod tokio_loader {
                             let user_agent =
                                 format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-                            let r = client
-                                .get(url)
+                            let r = match client
+                                .get(&url)
                                 .header("user-agent", user_agent)
                                 .send()
                                 .await
-                                .unwrap();
-                            let b = r.bytes().await.unwrap();
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!("tile {tile_id:?} request failed ({url}): {e}");
+                                    fail(tile_id, &ts, &repaint);
+                                    return;
+                                }
+                            };
+                            let status = r.status();
+                            if !status.is_success() {
+                                if status.as_u16() == 429 {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} rate limited (429) by {url}"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} HTTP {} from {url}",
+                                        status.as_u16()
+                                    );
+                                }
+                                fail(tile_id, &ts, &repaint);
+                                return;
+                            }
+                            let b = match r.bytes().await {
+                                Ok(b) => b.to_vec(),
+                                Err(e) => {
+                                    tracing::warn!("tile {tile_id:?} body read failed: {e}");
+                                    fail(tile_id, &ts, &repaint);
+                                    return;
+                                }
+                            };
 
-                            // PNG/JPEG decode is CPU-bound and can stall an
-                            // async worker; do it on the blocking pool so
-                            // the tokio reactor stays responsive.
-                            tokio::task::spawn_blocking(move || {
-                                let image = image::load_from_memory(&b.clone()).unwrap();
-                                let size = [image.width() as _, image.height() as _];
-                                let image_buffer = image.to_rgba8();
-                                let pixels = image_buffer.as_flat_samples();
-
-                                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                    size,
-                                    pixels.as_slice(),
-                                );
-
-                                ts.lock()
-                                    .unwrap()
-                                    .insert(tile_id, Fetch::Done(color_image.into()));
-                                ctx.request_repaint();
-                            });
+                            decode_and_store(b, tile_id, ts, repaint);
                         });
                     }
                 });
@@ -174,23 +281,21 @@ mod tokio_loader {
         }
     }
 
-    #[cfg(feature = "tokio")]
     impl Default for TokioTileLoader {
         fn default() -> Self {
             Self::new()
         }
     }
 
-    #[cfg(feature = "tokio")]
     impl TileLoader for TokioTileLoader {
-        fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>> {
+        fn tile(&self, url: String, tile_id: &TileId, repaint: RepaintSignal) -> TileFetch {
             let t = self.tiles.lock().unwrap();
             match t.get(tile_id) {
-                Some(Fetch::Pending) => None,
-                Some(Fetch::Done(c)) => Some(c.clone()),
+                Some(Fetch::Pending) => TileFetch::Loading,
+                Some(Fetch::Done(c)) => TileFetch::Ready(c.clone()),
                 None => {
-                    self.tx.blocking_send((*tile_id, url, ctx)).unwrap();
-                    None
+                    self.tx.blocking_send((*tile_id, url, repaint)).unwrap();
+                    TileFetch::Loading
                 }
             }
         }
@@ -204,17 +309,13 @@ mod tokio_loader {
     /// faster and reduces load on third-party tile servers.
     ///
     /// Unlike [`TokioTileLoader`], a successful tile lookup *consumes* the
-    /// in-memory entry: [`TileLoader::tile`] returns the [`Arc<ColorImage>`]
-    /// once and then drops it, since the [`crate::EMap`] widget caches the
-    /// uploaded [`egui::TextureHandle`] itself. This keeps the loader's
-    /// in-memory footprint small over long sessions.
+    /// in-memory entry: [`TileLoader::tile`] returns the [`Arc<TileImage>`]
+    /// once and then drops it, since the renderer caches the uploaded
+    /// GPU texture itself. This keeps the loader's in-memory footprint
+    /// small over long sessions.
     #[cfg(feature = "caching")]
     pub struct CachingTileLoader {
-        /// Channel into the background runtime; same protocol as
-        /// [`TokioTileLoader::tx`].
-        tx: Sender<(TileId, String, Context)>,
-        /// Short-lived in-memory hand-off table (entries are removed once
-        /// the widget picks them up).
+        tx: Sender<Job>,
         tiles: Arc<Mutex<HashMap<TileId, Fetch>>>,
     }
 
@@ -226,7 +327,7 @@ mod tokio_loader {
         /// There is no automatic eviction, so the cache grows monotonically
         /// — clean it manually if disk usage becomes a concern.
         pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(TileId, String, Context)>(1024);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Job>(1024);
             let tiles = Arc::new(Mutex::new(HashMap::new()));
             let t1 = tiles.clone();
 
@@ -240,7 +341,7 @@ mod tokio_loader {
                 rt.block_on(async move {
                     let client = Arc::new(ClientBuilder::default().build().unwrap());
                     loop {
-                        let Some((tile_id, url, ctx)) = rx.recv().await else {
+                        let Some((tile_id, url, repaint)) = rx.recv().await else {
                             break;
                         };
                         let ts = tiles.clone();
@@ -260,67 +361,84 @@ mod tokio_loader {
 
                             // Disk-cache hit: read the previously stored bytes
                             // and skip the network entirely.
-                            let exists = tokio::fs::metadata(&path).await;
-                            let exists = exists.is_ok();
-                            if exists {
-                                let b =
-                                    bytes::Bytes::from_owner(tokio::fs::read(&path).await.unwrap());
-
-                                let ctx = ctx.clone();
-                                let ts = ts.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let image = image::load_from_memory(&b.clone()).unwrap();
-                                    let size = [image.width() as _, image.height() as _];
-                                    let image_buffer = image.to_rgba8();
-                                    let pixels = image_buffer.as_flat_samples();
-
-                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                        size,
-                                        pixels.as_slice(),
-                                    );
-
-                                    ts.lock()
-                                        .unwrap()
-                                        .insert(tile_id, Fetch::Done(color_image.into()));
-                                    ctx.request_repaint();
-                                });
-                                return;
+                            if tokio::fs::metadata(&path).await.is_ok() {
+                                match tokio::fs::read(&path).await {
+                                    Ok(b) => {
+                                        decode_and_store(b, tile_id, ts, repaint);
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "tile {tile_id:?} cache read failed ({}): {e}",
+                                            path.display()
+                                        );
+                                        // Fall through to network on cache read error.
+                                    }
+                                }
                             }
 
                             let user_agent =
                                 format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-                            let r = client
-                                .get(url)
+                            let r = match client
+                                .get(&url)
                                 .header("user-agent", user_agent)
                                 .send()
                                 .await
-                                .unwrap();
+                            {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} request failed ({url}): {e}"
+                                    );
+                                    fail(tile_id, &ts, &repaint);
+                                    return;
+                                }
+                            };
                             let status = r.status();
-                            let b = r.bytes().await.unwrap();
+                            let b = match r.bytes().await {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} body read failed: {e}"
+                                    );
+                                    fail(tile_id, &ts, &repaint);
+                                    return;
+                                }
+                            };
 
                             // Only cache successful responses; persisting 4xx/5xx
                             // bodies would poison the cache with non-image data.
                             if status.is_success() {
-                                tokio::fs::create_dir_all(&dir).await.unwrap();
-                                tokio::fs::write(path, b.clone()).await.unwrap();
-
-                                tokio::task::spawn_blocking(move || {
-                                    let image = image::load_from_memory(&b.clone()).unwrap();
-                                    let size = [image.width() as _, image.height() as _];
-                                    let image_buffer = image.to_rgba8();
-                                    let pixels = image_buffer.as_flat_samples();
-
-                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                        size,
-                                        pixels.as_slice(),
+                                if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} mkdir {} failed: {e}",
+                                        dir.display()
                                     );
-
-                                    ts.lock()
-                                        .unwrap()
-                                        .insert(tile_id, Fetch::Done(color_image.into()));
-                                    ctx.request_repaint();
-                                });
+                                    fail(tile_id, &ts, &repaint);
+                                    return;
+                                }
+                                if let Err(e) = tokio::fs::write(&path, &b).await {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} cache write {} failed: {e}",
+                                        path.display()
+                                    );
+                                    // Continue: the tile decoded fine, just
+                                    // didn't persist. Fall through to decode.
+                                }
+                                decode_and_store(b.to_vec(), tile_id, ts, repaint);
+                            } else {
+                                if status.as_u16() == 429 {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} rate limited (429) by {url}"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "tile {tile_id:?} HTTP {} from {url}",
+                                        status.as_u16()
+                                    );
+                                }
+                                fail(tile_id, &ts, &repaint);
                             }
                         });
                     }
@@ -333,20 +451,17 @@ mod tokio_loader {
 
     #[cfg(feature = "caching")]
     impl TileLoader for CachingTileLoader {
-        fn tile(&self, url: String, tile_id: &TileId, ctx: Context) -> Option<Arc<ColorImage>> {
+        fn tile(&self, url: String, tile_id: &TileId, repaint: RepaintSignal) -> TileFetch {
             let mut t = self.tiles.lock().unwrap();
             match t.get(tile_id) {
-                Some(Fetch::Pending) => None,
-                Some(Fetch::Done(_)) => t.remove(tile_id).and_then(|f| {
-                    if let Fetch::Done(c) = f {
-                        Some(c)
-                    } else {
-                        None
-                    }
-                }),
+                Some(Fetch::Pending) => TileFetch::Loading,
+                Some(Fetch::Done(_)) => match t.remove(tile_id) {
+                    Some(Fetch::Done(c)) => TileFetch::Ready(c),
+                    _ => TileFetch::Loading,
+                },
                 None => {
-                    self.tx.blocking_send((*tile_id, url, ctx)).unwrap();
-                    None
+                    self.tx.blocking_send((*tile_id, url, repaint)).unwrap();
+                    TileFetch::Loading
                 }
             }
         }

@@ -9,7 +9,7 @@
 use crate::TileId;
 
 /// Strategy for turning a [`TileId`] into the URL the tile loader will fetch.
-pub trait TileUrlProvider {
+pub trait TileUrlProvider: Send + Sync {
     /// Format the URL for `tile_id`.
     fn url(&self, tile_id: TileId) -> String;
 }
@@ -20,7 +20,7 @@ pub trait TileUrlProvider {
 impl<O, F> TileUrlProvider for F
 where
     O: ToString,
-    F: Fn(&TileId) -> O,
+    F: Fn(&TileId) -> O + Send + Sync,
 {
     fn url(&self, tile_id: TileId) -> String {
         self(&tile_id).to_string()
