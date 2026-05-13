@@ -123,13 +123,27 @@ enum Shape {
 ///
 /// Dereferences to the underlying egui [`Response`], so callers can use
 /// `.clicked()`, `.dragged()`, etc. directly. Adds map-specific data such as
-/// the cursor's geographic position.
+/// the cursor's geographic position and the current viewport.
 pub struct EMapResponse {
     /// The egui interaction response for the allocated map rectangle.
     response: Response,
 
     /// Geographic position (lon/lat) under the mouse cursor, if hovering.
     pointer_position: Option<Point<f64>>,
+
+    /// Geographic rectangle (lon/lat) covering the on-screen UI rectangle.
+    visible_bounds: geo::Rect<f64>,
+
+    /// Geographic rectangle (lon/lat) covering the centered square the
+    /// projection actually spans. Wider than `visible_bounds` when the UI
+    /// rectangle is non-square; matches the area tiles are fetched for.
+    projected_bounds: geo::Rect<f64>,
+
+    /// Map center (lon/lat).
+    center: Point<f64>,
+
+    /// Current zoom level (fractional during interactive wheel zoom).
+    zoom: f64,
 }
 
 impl EMapResponse {
@@ -138,6 +152,35 @@ impl EMapResponse {
     /// Returns `None` when the cursor is outside the map rectangle.
     pub fn pointer_position(&self) -> Option<Point<f64>> {
         self.pointer_position
+    }
+
+    /// Geographic bounds (lon/lat) of exactly what the user sees on screen.
+    ///
+    /// Use this to cull markers, fetch external data for the viewport, or
+    /// drive a coordinate readout. At very low zoom levels with horizontal
+    /// panning the rectangle can technically span more than 360° of
+    /// longitude; callers that care should normalize the result.
+    pub fn visible_bounds(&self) -> geo::Rect<f64> {
+        self.visible_bounds
+    }
+
+    /// Geographic bounds (lon/lat) of the centered square the projection
+    /// covers. This is the area the tile loader is asked about every frame
+    /// and is therefore a superset of [`visible_bounds`](Self::visible_bounds)
+    /// whenever the host UI rectangle is non-square.
+    pub fn projected_bounds(&self) -> geo::Rect<f64> {
+        self.projected_bounds
+    }
+
+    /// Map center (lon/lat) at the end of this frame.
+    pub fn center(&self) -> Point<f64> {
+        self.center
+    }
+
+    /// Current zoom level. Integer values are conventional XYZ levels; the
+    /// fractional part appears during interactive wheel zoom.
+    pub fn zoom(&self) -> f64 {
+        self.zoom
     }
 }
 
@@ -551,11 +594,43 @@ impl<'t> EMap<'t> {
             state.y = state.y.clamp(0.0, 1.0);
         }
 
+        // Compute the post-drag viewport so the returned response reflects
+        // what will be drawn on the next frame. n_rect (normalized Mercator)
+        // is recomputed because the drag above may have moved state.{x,y}.
+        let n_rect_after = norm_rect(state.x, state.y, state.zoom, desired_tiles);
+
+        let visible_top_left_norm = scale_rect(
+            Point::new(rect.min.x as f64, rect.min.y as f64),
+            view_rect,
+            n_rect_after,
+        );
+        let visible_bottom_right_norm = scale_rect(
+            Point::new(rect.max.x as f64, rect.max.y as f64),
+            view_rect,
+            n_rect_after,
+        );
+        let visible_bounds = geo::Rect::new(
+            reverse_normalized_mercator(visible_top_left_norm),
+            reverse_normalized_mercator(visible_bottom_right_norm),
+        );
+
+        let projected_bounds = geo::Rect::new(
+            reverse_normalized_mercator(Point::from(n_rect_after.min())),
+            reverse_normalized_mercator(Point::from(n_rect_after.max())),
+        );
+
+        let center = reverse_normalized_mercator(Point::new(state.x, state.y));
+        let zoom = state.zoom;
+
         state.store(ui.ctx(), self.id);
 
         EMapResponse {
             response,
             pointer_position: self.pointer_position,
+            visible_bounds,
+            projected_bounds,
+            center,
+            zoom,
         }
     }
 
