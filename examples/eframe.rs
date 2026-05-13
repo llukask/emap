@@ -83,6 +83,47 @@ impl eframe::App for EMapApp {
             } else if r.secondary_clicked() {
                 self.points.pop();
             }
+
+            // Demonstrate the data exposed via EMapResponse. The window
+            // floats over the map and updates every frame, so it doubles as
+            // a sanity check that the bounds track pan + wheel zoom.
+            let center = r.center();
+            let visible = r.visible_bounds();
+            let projected = r.projected_bounds();
+            egui::Window::new("viewport")
+                .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("zoom:   {:.2}", r.zoom()));
+                    ui.label(format!(
+                        "center: {:.5}, {:.5}",
+                        center.y(),
+                        center.x(),
+                    ));
+                    ui.label(format!(
+                        "visible lon: {:.5} … {:.5}",
+                        visible.min().x,
+                        visible.max().x,
+                    ));
+                    ui.label(format!(
+                        "visible lat: {:.5} … {:.5}",
+                        visible.min().y,
+                        visible.max().y,
+                    ));
+                    ui.label(format!(
+                        "projected lon: {:.5} … {:.5}",
+                        projected.min().x,
+                        projected.max().x,
+                    ));
+                    ui.label(format!(
+                        "projected lat: {:.5} … {:.5}",
+                        projected.min().y,
+                        projected.max().y,
+                    ));
+                    if let Some(p) = r.pointer_position() {
+                        ui.label(format!("pointer: {:.5}, {:.5}", p.y(), p.x()));
+                    }
+                });
         });
     }
 }
