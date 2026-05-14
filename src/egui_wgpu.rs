@@ -142,7 +142,7 @@ impl EmapHandle {
             glam::Vec2::new((p.x - rect.min.x) * ppp, (p.y - rect.min.y) * ppp)
         });
         let scroll_delta_y = if response.hovered() {
-            ui.ctx().input(|i| i.raw_scroll_delta.y)
+            ui.ctx().input(|i| i.smooth_scroll_delta.y)
         } else {
             0.0
         };

@@ -12,24 +12,25 @@ caching = ["tokio", "tokio/fs", "dep:bytes"]
 egui-wgpu = ["dep:egui", "dep:egui-wgpu"]
 
 [dependencies]
-wgpu = "24"
+wgpu = "29"
 bytemuck = { version = "1.18", features = ["derive"] }
-glam = { version = "0.29", features = ["bytemuck"] }
+glam = { version = "0.32", features = ["bytemuck"] }
 lyon = "1.0"
-geo = { version = "0.28.0", default-features = false }
-image = { version = "0.25.5", default-features = false, features = [
+geo = { version = "0.33", default-features = false }
+image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
 ] }
-bytes = { version = "1.10.0", optional = true }
+bytes = { version = "1.10", optional = true }
 tracing = "0.1"
-egui = { version = "0.31", optional = true }
-egui-wgpu = { version = "0.31", optional = true }
+egui = { version = "0.34", optional = true }
+egui-wgpu = { version = "0.34", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12.12", default-features = false, optional = true, features = [
+reqwest = { version = "0.13", default-features = false, optional = true, features = [
     "http2",
-    "rustls-tls",
+    "rustls",
+    "rustls-native-certs",
 ] }
 tokio = { version = "1", optional = true, default-features = false, features = [
     "rt-multi-thread",
@@ -41,7 +42,7 @@ tokio = { version = "1", optional = true, default-features = false, features = [
 winit = "0.30"
 pollster = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-eframe = { version = "0.31", default-features = false, features = [
+eframe = { version = "0.34", default-features = false, features = [
     "default_fonts",
     "wgpu",
     "wayland",

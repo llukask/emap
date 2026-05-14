@@ -119,8 +119,8 @@ impl OverlayRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("emap.overlay.pl"),
-            bind_group_layouts: &[&viewport_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&viewport_bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -152,7 +152,7 @@ impl OverlayRenderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

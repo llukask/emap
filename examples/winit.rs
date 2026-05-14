@@ -90,8 +90,9 @@ impl App {
                 required_limits:
                     wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                trace: wgpu::Trace::default(),
             },
-            None,
         ))
         .expect("request_device");
 
@@ -152,13 +153,14 @@ impl App {
         let Some(gfx) = &mut self.gfx else { return };
 
         let frame_texture = match gfx.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 gfx.surface.configure(&gfx.device, &gfx.surface_config);
                 return;
             }
-            Err(e) => {
-                eprintln!("get_current_texture: {e:?}");
+            other => {
+                eprintln!("get_current_texture: {other:?}");
                 return;
             }
         };
@@ -207,6 +209,7 @@ impl App {
                 label: Some("emap.example.pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -221,6 +224,7 @@ impl App {
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
+                multiview_mask: None,
             });
 
             gfx.emap.render(

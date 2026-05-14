@@ -77,10 +77,11 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _eframe_frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _eframe_frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 let (rect, response) = self.emap.show(ui, self.shapes());
 
                 if response.clicked()
@@ -99,7 +100,7 @@ impl eframe::App for App {
             });
 
         if let Some(r) = self.emap.last_response() {
-            viewport_window(ctx, &r, self.polygon_points.len());
+            viewport_window(&ctx, &r, self.polygon_points.len());
         }
     }
 }
