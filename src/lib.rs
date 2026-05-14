@@ -272,6 +272,9 @@ pub struct EMap {
     tile_url_provider: Arc<dyn TileUrlProvider>,
     tile_loader: Arc<dyn TileLoader>,
     tile_size: f64,
+    /// Upper bound applied to the float zoom value. Defaults to 19.0
+    /// (OSM's deepest tile level). Override via [`set_max_zoom`](Self::set_max_zoom).
+    max_zoom: f64,
 
     tile_renderer: TileRenderer,
     overlay_renderer: OverlayRenderer,
@@ -304,6 +307,7 @@ impl EMap {
             tile_url_provider: Arc::new(OsmStandardTileUrlProvider),
             tile_loader: DEFAULT_TILE_LOADER.clone(),
             tile_size: 256.0,
+            max_zoom: 19.0,
             tile_renderer: TileRenderer::new(device, target_format),
             overlay_renderer: OverlayRenderer::new(device, target_format),
             repaint,
@@ -332,6 +336,21 @@ impl EMap {
         self.tile_size = size;
     }
 
+    /// Set the upper bound on the float zoom value.
+    ///
+    /// Applies both to wheel-driven zoom and to explicit
+    /// [`set_position`](Self::set_position) /
+    /// [`set_initial_position`](Self::set_initial_position) calls.
+    /// Default: `19.0` (deepest tile level served by OSM).
+    pub fn set_max_zoom(&mut self, max_zoom: f64) {
+        self.max_zoom = max_zoom;
+        // Re-clamp current state so an immediate lowering takes effect
+        // without waiting for the next scroll event.
+        if self.state.zoom > self.max_zoom {
+            self.state.zoom = self.max_zoom;
+        }
+    }
+
     /// Seed center + zoom only on first show.
     ///
     /// No-op once the user has interacted or [`set_position`](Self::set_position)
@@ -339,6 +358,9 @@ impl EMap {
     pub fn set_initial_position(&mut self, lat: f64, lon: f64, zoom: u8) {
         if !self.positioned {
             self.state = EMapState::with_position(lat, lon, zoom);
+            if self.state.zoom > self.max_zoom {
+                self.state.zoom = self.max_zoom;
+            }
             self.positioned = true;
         }
     }
@@ -346,6 +368,9 @@ impl EMap {
     /// Force-update the persisted center and zoom.
     pub fn set_position(&mut self, lat: f64, lon: f64, zoom: u8) {
         self.state = EMapState::with_position(lat, lon, zoom);
+        if self.state.zoom > self.max_zoom {
+            self.state.zoom = self.max_zoom;
+        }
         self.positioned = true;
     }
 
@@ -415,7 +440,7 @@ impl EMap {
             let pointer_norm = scale_rect(pos_geo, view, n_rect);
 
             self.state.zoom += input.scroll_delta_y as f64 * 0.01;
-            self.state.zoom = self.state.zoom.clamp(0.75, 20.1);
+            self.state.zoom = self.state.zoom.clamp(0.75, self.max_zoom);
 
             let n_rect2 =
                 norm_rect(self.state.x, self.state.y, self.state.zoom, desired_tiles);
