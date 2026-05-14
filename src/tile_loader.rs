@@ -122,6 +122,23 @@ mod tokio_loader {
 
     use super::*;
 
+    /// Format an error together with its full `source()` chain.
+    ///
+    /// Reqwest's `Display` impl only emits the top-level message
+    /// (e.g. `"error sending request"`), so logging `{e}` alone hides
+    /// the actual cause (TLS handshake failure, DNS error, etc.). This
+    /// walks `Error::source()` so the underlying reason shows up too.
+    fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+        use std::fmt::Write as _;
+        let mut out = format!("{e}");
+        let mut src = e.source();
+        while let Some(s) = src {
+            let _ = write!(out, ": {s}");
+            src = s.source();
+        }
+        out
+    }
+
     /// Lifecycle of a single tile within a loader's in-memory table.
     ///
     /// Used to deduplicate concurrent requests for the same tile: the first
@@ -155,7 +172,7 @@ mod tokio_loader {
                         "tile {:?} decode failed ({} bytes): {}",
                         tile_id,
                         bytes.len(),
-                        e
+                        error_chain(&e)
                     );
                     fail(tile_id, &tiles, &repaint);
                     return;
@@ -242,7 +259,10 @@ mod tokio_loader {
                             {
                                 Ok(r) => r,
                                 Err(e) => {
-                                    tracing::warn!("tile {tile_id:?} request failed ({url}): {e}");
+                                    tracing::warn!(
+                                        "tile {tile_id:?} request failed ({url}): {}",
+                                        error_chain(&e)
+                                    );
                                     fail(tile_id, &ts, &repaint);
                                     return;
                                 }
@@ -265,7 +285,10 @@ mod tokio_loader {
                             let b = match r.bytes().await {
                                 Ok(b) => b.to_vec(),
                                 Err(e) => {
-                                    tracing::warn!("tile {tile_id:?} body read failed: {e}");
+                                    tracing::warn!(
+                                        "tile {tile_id:?} body read failed: {}",
+                                        error_chain(&e)
+                                    );
                                     fail(tile_id, &ts, &repaint);
                                     return;
                                 }
@@ -369,8 +392,9 @@ mod tokio_loader {
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            "tile {tile_id:?} cache read failed ({}): {e}",
-                                            path.display()
+                                            "tile {tile_id:?} cache read failed ({}): {}",
+                                            path.display(),
+                                            error_chain(&e)
                                         );
                                         // Fall through to network on cache read error.
                                     }
@@ -389,7 +413,8 @@ mod tokio_loader {
                                 Ok(r) => r,
                                 Err(e) => {
                                     tracing::warn!(
-                                        "tile {tile_id:?} request failed ({url}): {e}"
+                                        "tile {tile_id:?} request failed ({url}): {}",
+                                        error_chain(&e)
                                     );
                                     fail(tile_id, &ts, &repaint);
                                     return;
@@ -400,7 +425,8 @@ mod tokio_loader {
                                 Ok(b) => b,
                                 Err(e) => {
                                     tracing::warn!(
-                                        "tile {tile_id:?} body read failed: {e}"
+                                        "tile {tile_id:?} body read failed: {}",
+                                        error_chain(&e)
                                     );
                                     fail(tile_id, &ts, &repaint);
                                     return;
@@ -412,16 +438,18 @@ mod tokio_loader {
                             if status.is_success() {
                                 if let Err(e) = tokio::fs::create_dir_all(&dir).await {
                                     tracing::warn!(
-                                        "tile {tile_id:?} mkdir {} failed: {e}",
-                                        dir.display()
+                                        "tile {tile_id:?} mkdir {} failed: {}",
+                                        dir.display(),
+                                        error_chain(&e)
                                     );
                                     fail(tile_id, &ts, &repaint);
                                     return;
                                 }
                                 if let Err(e) = tokio::fs::write(&path, &b).await {
                                     tracing::warn!(
-                                        "tile {tile_id:?} cache write {} failed: {e}",
-                                        path.display()
+                                        "tile {tile_id:?} cache write {} failed: {}",
+                                        path.display(),
+                                        error_chain(&e)
                                     );
                                     // Continue: the tile decoded fine, just
                                     // didn't persist. Fall through to decode.
