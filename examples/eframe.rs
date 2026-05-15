@@ -150,6 +150,10 @@ fn viewport_window(ctx: &egui::Context, r: &EMapResponse, polygon_points: usize)
                         p.max().x,
                     ));
                     ui.end_row();
+
+                    ui.label("in-flight tiles");
+                    ui.monospace(format!("{}", r.in_flight_tiles()));
+                    ui.end_row();
                 });
 
             ui.separator();

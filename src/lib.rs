@@ -147,6 +147,7 @@ pub struct EMapResponse {
     projected_bounds: geo::Rect<f64>,
     center: Point<f64>,
     zoom: f64,
+    in_flight_tiles: usize,
 }
 
 impl EMapResponse {
@@ -172,6 +173,12 @@ impl EMapResponse {
     /// Current zoom level (fractional during interactive wheel zoom).
     pub fn zoom(&self) -> f64 {
         self.zoom
+    }
+    /// Number of tile fetches the configured [`TileLoader`] reports as
+    /// still in flight at the end of this frame. `0` for synchronous
+    /// loaders (e.g. [`DummyLoader`]).
+    pub fn in_flight_tiles(&self) -> usize {
+        self.in_flight_tiles
     }
 }
 
@@ -700,6 +707,7 @@ impl EMap {
             projected_bounds,
             center: reverse_normalized_mercator(Point::new(self.state.x, self.state.y)),
             zoom: self.state.zoom,
+            in_flight_tiles: self.tile_loader.in_flight(),
         }
     }
 

@@ -83,6 +83,15 @@ pub trait TileLoader: Send + Sync {
     /// doesn't need to know about URL templating. `repaint` is held by
     /// async implementations and called when the tile finishes loading.
     fn tile(&self, url: String, tile_id: &TileId, repaint: RepaintSignal) -> TileFetch;
+
+    /// Number of tile requests currently in flight.
+    ///
+    /// Synchronous loaders (e.g. [`DummyLoader`]) always return `0`; async
+    /// implementations report the count of tiles for which a fetch has been
+    /// issued but no decoded image is available yet.
+    fn in_flight(&self) -> usize {
+        0
+    }
 }
 
 /// Stub loader that always returns a fixed 64×64 checkerboard image.
@@ -322,6 +331,17 @@ mod tokio_loader {
                 }
             }
         }
+
+        fn in_flight(&self) -> usize {
+            // Lock can only fail if a previous holder panicked while
+            // mutating the map; none of the call sites do so.
+            self.tiles
+                .lock()
+                .expect("tiles mutex not poisoned")
+                .values()
+                .filter(|f| matches!(f, Fetch::Pending))
+                .count()
+        }
     }
 
     /// HTTP-fetching loader with a persistent on-disk tile cache.
@@ -492,6 +512,17 @@ mod tokio_loader {
                     TileFetch::Loading
                 }
             }
+        }
+
+        fn in_flight(&self) -> usize {
+            // Lock can only fail if a previous holder panicked while
+            // mutating the map; none of the call sites do so.
+            self.tiles
+                .lock()
+                .expect("tiles mutex not poisoned")
+                .values()
+                .filter(|f| matches!(f, Fetch::Pending))
+                .count()
         }
     }
 }
